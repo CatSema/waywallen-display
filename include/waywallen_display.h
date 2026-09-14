@@ -51,13 +51,16 @@ extern "C" {
  * On-the-wire protocol version. Independent of the library API/ABI
  * version above — this number tracks the `<protocol version="...">`
  * attribute in waywallen_display_v1.xml and is sent verbatim in
- * `hello.protocol_version`. The daemon accepts only the exact v8
+ * `hello.protocol_version`. The daemon accepts only the exact v9
  * contract and rejects every other value with `error{code=2}`.
  */
-#define WAYWALLEN_DISPLAY_PROTOCOL_VERSION 8
+#define WAYWALLEN_DISPLAY_PROTOCOL_VERSION 9
 
 /* Presentation capabilities declared before connecting. */
-#define WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR (1u << 0)
+#define WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR      (1u << 0)
+#define WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION (1u << 1)
+#define WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION (1u << 2)
+#define WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION (1u << 3)
 
 /*
  * Library version baked in at build time.
@@ -258,6 +261,11 @@ typedef struct waywallen_textures {
 typedef struct waywallen_binding {
     waywallen_textures_t           textures;
     waywallen_composition_config_t config;
+    /* The pool replaces different wallpaper content. Hosts that declared
+     * a transition capability keep presenting their last content and
+     * animate to this pool's first frame using the current presentation
+     * snapshot's transition config. Never set while that kind is NONE. */
+    bool transition;
 } waywallen_binding_t;
 
 typedef struct waywallen_frame {
@@ -679,7 +687,7 @@ int waywallen_display_get_presentation_snapshot(
 typedef enum waywallen_disconnect_reason
 {
     WAYWALLEN_DISCONNECT_NONE = 0,
-    /* daemon `error.code == 2`: hello.protocol_version is not v8. */
+    /* daemon `error.code == 2`: hello.protocol_version is not v9. */
     WAYWALLEN_DISCONNECT_VERSION_UNSUPPORTED = 1,
     /* Retained as a host-facing category for older stored diagnostics. */
     WAYWALLEN_DISCONNECT_PROTOCOL_MISMATCH = 2,

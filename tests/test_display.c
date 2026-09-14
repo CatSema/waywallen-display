@@ -68,6 +68,7 @@ struct test_state {
     int  last_disconnect_code;
     char last_disconnect_msg[256];
 
+    bool                                   last_binding_transition;
     uint64_t                               last_binding_buffer_generation;
     uint64_t                               last_composition_buffer_generation;
     uint64_t                               last_composition_generation;
@@ -102,6 +103,7 @@ struct test_state {
 static void cb_binding_ready(void* ud, const waywallen_binding_t* binding) {
     struct test_state* ts = (struct test_state*)ud;
     ts->on_binding_ready_count++;
+    ts->last_binding_transition            = binding->transition;
     const waywallen_textures_t* t          = &binding->textures;
     ts->last_binding_buffer_generation     = t->buffer_generation;
     ts->last_composition_buffer_generation = binding->config.buffer_generation;
@@ -159,15 +161,25 @@ static const waywallen_display_callbacks_t kCallbacks = {
     .user_data                = NULL,
 };
 
+static waywallen_transition_config_t transition_config(waywallen_transition_kind_t kind) {
+    waywallen_transition_config_t transition = { 0 };
+    transition.kind                          = kind;
+    transition.duration_ms                   = 500;
+    transition.origin_x                      = 0.5f;
+    transition.origin_y                      = 0.5f;
+    return transition;
+}
+
 static ww_evt_display_accepted_t accepted_event(uint64_t display_id) {
     ww_evt_display_accepted_t accepted                    = { 0 };
     accepted.display_id                                   = display_id;
     accepted.presentation.config.generation               = 1;
     accepted.presentation.config.pause_effect.kind        = WAYWALLEN_PAUSE_EFFECT_KIND_NONE;
     accepted.presentation.config.pause_effect.blur.radius = 30;
-    accepted.presentation.state.generation                = 1;
-    accepted.presentation.state.config_generation         = 1;
-    accepted.presentation.state.pause_effect.active       = false;
+    accepted.presentation.config.transition = transition_config(WAYWALLEN_TRANSITION_KIND_NONE);
+    accepted.presentation.state.generation  = 1;
+    accepted.presentation.state.config_generation   = 1;
+    accepted.presentation.state.pause_effect.active = false;
     return accepted;
 }
 
@@ -474,8 +486,8 @@ static int receive_import_failure(int client_fd, struct test_state* ts) {
     return 0;
 }
 
-static int send_bind_buffers(int client_fd, uint64_t buffer_generation,
-                             uint64_t composition_generation) {
+static int send_bind_buffers_with_transition(int client_fd, uint64_t buffer_generation,
+                                             uint64_t composition_generation, bool transition) {
     int dmabuf[2];
     if (pipe(dmabuf) != 0) return -1;
 
@@ -501,6 +513,7 @@ static int send_bind_buffers(int client_fd, uint64_t buffer_generation,
             .transform = 0,
             .clear_color = { .r = 0.1f, .g = 0.2f, .b = 0.3f, .a = 1.0f },
         },
+        .transition = transition,
     };
     ww_buf_t out;
     ww_buf_init(&out);
@@ -512,6 +525,12 @@ static int send_bind_buffers(int client_fd, uint64_t buffer_generation,
     close(dmabuf[0]);
     close(dmabuf[1]);
     return rc;
+}
+
+static int send_bind_buffers(int client_fd, uint64_t buffer_generation,
+                             uint64_t composition_generation) {
+    return send_bind_buffers_with_transition(
+        client_fd, buffer_generation, composition_generation, false);
 }
 
 static int send_composition_config(int client_fd, uint64_t buffer_generation,
@@ -537,13 +556,16 @@ static int send_composition_config(int client_fd, uint64_t buffer_generation,
     return rc;
 }
 
-static int send_presentation_snapshot(int client_fd, uint64_t config_generation,
-                                      uint64_t state_generation, waywallen_pause_effect_kind_t kind,
-                                      uint32_t radius, bool active) {
+static int send_presentation_snapshot_with_transition(int client_fd, uint64_t config_generation,
+                                                      uint64_t state_generation,
+                                                      waywallen_pause_effect_kind_t kind,
+                                                      uint32_t radius, bool active,
+                                                      waywallen_transition_config_t transition) {
     ww_evt_set_presentation_snapshot_t event           = { 0 };
     event.presentation.config.generation               = config_generation;
     event.presentation.config.pause_effect.kind        = kind;
     event.presentation.config.pause_effect.blur.radius = radius;
+    event.presentation.config.transition               = transition;
     event.presentation.state.generation                = state_generation;
     event.presentation.state.config_generation         = config_generation;
     event.presentation.state.pause_effect.active       = active;
@@ -556,6 +578,19 @@ static int send_presentation_snapshot(int client_fd, uint64_t config_generation,
     }
     ww_buf_free(&out);
     return rc;
+}
+
+static int send_presentation_snapshot(int client_fd, uint64_t config_generation,
+                                      uint64_t state_generation, waywallen_pause_effect_kind_t kind,
+                                      uint32_t radius, bool active) {
+    return send_presentation_snapshot_with_transition(
+        client_fd,
+        config_generation,
+        state_generation,
+        kind,
+        radius,
+        active,
+        transition_config(WAYWALLEN_TRANSITION_KIND_NONE));
 }
 
 static int send_presentation_state(int client_fd, uint64_t state_generation,
@@ -781,6 +816,44 @@ static int handler_unknown_pause_effect_kind(int client_fd, struct test_state* t
     if (send_presentation_snapshot(client_fd, 2, 2, (waywallen_pause_effect_kind_t)7, 30, false) !=
         0)
         return -1;
+    sleep_ms(50);
+    return 0;
+}
+
+static int handler_transition_bind(int client_fd, struct test_state* ts) {
+    if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
+    if (send_presentation_snapshot_with_transition(
+            client_fd,
+            2,
+            2,
+            WAYWALLEN_PAUSE_EFFECT_KIND_NONE,
+            30,
+            false,
+            transition_config(WAYWALLEN_TRANSITION_KIND_FADE)) != 0)
+        return -1;
+    if (send_bind_buffers_with_transition(client_fd, 1, 1, true) != 0) return -1;
+    sleep_ms(50);
+    return 0;
+}
+
+static int handler_undeclared_transition_kind(int client_fd, struct test_state* ts) {
+    if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
+    if (send_presentation_snapshot_with_transition(
+            client_fd,
+            2,
+            2,
+            WAYWALLEN_PAUSE_EFFECT_KIND_NONE,
+            30,
+            false,
+            transition_config(WAYWALLEN_TRANSITION_KIND_WIPE)) != 0)
+        return -1;
+    sleep_ms(50);
+    return 0;
+}
+
+static int handler_transition_bind_without_kind(int client_fd, struct test_state* ts) {
+    if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
+    if (send_bind_buffers_with_transition(client_fd, 1, 1, true) != 0) return -1;
     sleep_ms(50);
     return 0;
 }
@@ -1105,6 +1178,72 @@ static void test_unknown_pause_effect_kind_is_protocol_error(void) {
     pthread_join(srv, NULL);
     ts_teardown(&ts);
     printf("  ok test_unknown_pause_effect_kind_is_protocol_error\n");
+}
+
+static void test_transition_bind_reaches_host(void) {
+    struct test_state ts;
+    ts_init(&ts);
+    pthread_t srv = spawn_server(&ts, handler_transition_bind);
+
+    waywallen_display_t* d = make_client(&ts);
+    assert(waywallen_display_set_presentation_caps(d, WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION) ==
+           WAYWALLEN_OK);
+    assert(begin_test_display(d, ts.sock_path, 1920, 1080) == WAYWALLEN_OK);
+    assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+    assert(ts.presentation_caps == WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION);
+    assert(dispatch_next_event(d) == WAYWALLEN_OK); /* snapshot with fade */
+    assert(ts.last_presentation.config.transition.kind == WAYWALLEN_TRANSITION_KIND_FADE);
+    assert(ts.last_presentation.config.transition.duration_ms == 500);
+    assert(dispatch_next_event(d) == WAYWALLEN_OK); /* bind with transition */
+    assert(ts.on_binding_ready_count == 1);
+    assert(ts.last_binding_transition);
+    assert(ts.on_disconnected_count == 0);
+
+    waywallen_display_close(d);
+    waywallen_display_free(d);
+    pthread_join(srv, NULL);
+    ts_teardown(&ts);
+    printf("  ok test_transition_bind_reaches_host\n");
+}
+
+static void test_undeclared_transition_kind_is_protocol_error(void) {
+    struct test_state ts;
+    ts_init(&ts);
+    pthread_t srv = spawn_server(&ts, handler_undeclared_transition_kind);
+
+    waywallen_display_t* d = make_client(&ts);
+    assert(waywallen_display_set_presentation_caps(d, WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION) ==
+           WAYWALLEN_OK);
+    assert(begin_test_display(d, ts.sock_path, 1920, 1080) == WAYWALLEN_OK);
+    assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+    assert(dispatch_next_event(d) == WAYWALLEN_ERR_PROTO);
+    assert(ts.on_disconnected_count == 1);
+    assert(strcmp(ts.last_disconnect_msg, "invalid presentation snapshot") == 0);
+
+    waywallen_display_free(d);
+    pthread_join(srv, NULL);
+    ts_teardown(&ts);
+    printf("  ok test_undeclared_transition_kind_is_protocol_error\n");
+}
+
+static void test_transition_bind_without_kind_is_protocol_error(void) {
+    struct test_state ts;
+    ts_init(&ts);
+    pthread_t srv = spawn_server(&ts, handler_transition_bind_without_kind);
+
+    waywallen_display_t* d = make_client(&ts);
+    assert(begin_test_display(d, ts.sock_path, 1920, 1080) == WAYWALLEN_OK);
+    assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+    assert(dispatch_next_event(d) == WAYWALLEN_ERR_PROTO);
+    assert(ts.on_binding_ready_count == 0);
+    assert(ts.on_disconnected_count == 1);
+    assert(strcmp(ts.last_disconnect_msg, "bind_buffers transition without a transition kind") ==
+           0);
+
+    waywallen_display_free(d);
+    pthread_join(srv, NULL);
+    ts_teardown(&ts);
+    printf("  ok test_transition_bind_without_kind_is_protocol_error\n");
 }
 
 /* No backend bound → consumer_caps probe falls through to the
@@ -1567,6 +1706,9 @@ int main(void) {
     test_cross_generation_state_is_protocol_error();
     test_invalid_presentation_radius_is_protocol_error();
     test_unknown_pause_effect_kind_is_protocol_error();
+    test_transition_bind_reaches_host();
+    test_undeclared_transition_kind_is_protocol_error();
+    test_transition_bind_without_kind_is_protocol_error();
     test_consumer_caps_without_backend();
     test_partial_welcome();
     test_server_closes_during_welcome_wait();
