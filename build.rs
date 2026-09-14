@@ -108,11 +108,13 @@ fn compile_layer_shell_shaders(manifest_dir: &Path, out_dir: &Path) {
     let fullscreen_vertex_path = shader_dir.join("fullscreen.vert");
     let blur_fragment_path = shader_dir.join("blur.frag");
     let downsample_fragment_path = shader_dir.join("downsample.frag");
+    let transition_fragment_path = shader_dir.join("transition.frag");
     let vertex = compile_shader(&vertex_path, "vert", out_dir);
     let fragment = compile_shader(&fragment_path, "frag", out_dir);
     let fullscreen_vertex = compile_shader(&fullscreen_vertex_path, "vert", out_dir);
     let blur_fragment = compile_shader(&blur_fragment_path, "frag", out_dir);
     let downsample_fragment = compile_shader(&downsample_fragment_path, "frag", out_dir);
+    let transition_fragment = compile_shader(&transition_fragment_path, "frag", out_dir);
     let mut generated = String::new();
     write_shader_words(&mut generated, "VERTEX_SHADER", &vertex);
     write_shader_words(&mut generated, "FRAGMENT_SHADER", &fragment);
@@ -127,6 +129,11 @@ fn compile_layer_shell_shaders(manifest_dir: &Path, out_dir: &Path) {
         "DOWNSAMPLE_FRAGMENT_SHADER",
         &downsample_fragment,
     );
+    write_shader_words(
+        &mut generated,
+        "TRANSITION_FRAGMENT_SHADER",
+        &transition_fragment,
+    );
     fs::write(out_dir.join("layer_shell_shaders.rs"), generated)
         .expect("write generated layer-shell shaders");
 
@@ -140,6 +147,10 @@ fn compile_layer_shell_shaders(manifest_dir: &Path, out_dir: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
         downsample_fragment_path.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        transition_fragment_path.display()
     );
     println!("cargo:rerun-if-env-changed=GLSLANG_VALIDATOR");
 }

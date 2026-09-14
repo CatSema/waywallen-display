@@ -1672,10 +1672,18 @@ fn start_display_session(sock: &Path, binding: &Rc<OutputBinding>) -> Result<Dis
         if rc < 0 {
             bail!("waywallen_display_bind_vulkan failed: {rc}");
         }
-        let presentation_caps = if binding.presenter.lock().unwrap().supports_pause_blur() {
-            sys::WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR
-        } else {
-            0
+        let presentation_caps = {
+            let presenter = binding.presenter.lock().unwrap();
+            let mut caps = 0;
+            if presenter.supports_pause_blur() {
+                caps |= sys::WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR;
+            }
+            if presenter.supports_transitions() {
+                caps |= sys::WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION
+                    | sys::WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION
+                    | sys::WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION;
+            }
+            caps
         };
         let rc =
             unsafe { sys::waywallen_display_set_presentation_caps(display, presentation_caps) };
@@ -1841,20 +1849,22 @@ unsafe extern "C" fn on_binding_ready(
         return;
     }
     log::info!(
-        "[{}] Vulkan producer binding ready: generation={} count={} {}x{} fourcc=0x{:08x}",
+        "[{}] Vulkan producer binding ready: generation={} count={} {}x{} fourcc=0x{:08x} transition={}",
         binding.display_name,
         t.buffer_generation,
         t.count,
         t.tex_width,
         t.tex_height,
-        t.fourcc
+        t.fourcc,
+        ready.transition
     );
     let raw_images = std::slice::from_raw_parts(t.vk_images, t.count as usize);
     let images = raw_images
         .iter()
         .map(|image| vk::Image::from_raw(*image as usize as u64))
         .collect::<Vec<_>>();
-    if let Err(error) = binding.presenter.lock().unwrap().install_direct_binding(
+    let mut presenter = binding.presenter.lock().unwrap();
+    if let Err(error) = presenter.install_direct_binding(
         t.buffer_generation,
         vk::Extent2D {
             width: t.tex_width,
@@ -1868,6 +1878,10 @@ unsafe extern "C" fn on_binding_ready(
         );
         return;
     }
+    if ready.transition {
+        presenter.arm_transition();
+    }
+    drop(presenter);
     apply_composition_config(binding, &ready.config);
 }
 
@@ -1972,23 +1986,45 @@ unsafe extern "C" fn on_presentation_snapshot(
         active: presentation.state.pause_effect.active,
         radius: pause.blur.radius,
     };
-    let changed = binding
-        .presenter
-        .lock()
-        .unwrap()
-        .apply_pause_snapshot(target, Instant::now());
+    let transition = transition_presentation(&presentation.config.transition);
+    let changed = {
+        let mut presenter = binding.presenter.lock().unwrap();
+        let pause_changed = presenter.apply_pause_snapshot(target, Instant::now());
+        presenter.apply_transition_snapshot(transition) || pause_changed
+    };
     log::debug!(
-        "[{}] Pause Effect snapshot cfg={} state={} configured={} active={} radius={}",
+        "[{}] Pause Effect snapshot cfg={} state={} configured={} active={} radius={} transition={:?}",
         binding.display_name,
         presentation.config.generation,
         presentation.state.generation,
         target.configured,
         target.active,
-        target.radius
+        target.radius,
+        transition
     );
     if changed {
         request_present(binding);
     }
+}
+
+fn transition_presentation(
+    config: &sys::waywallen_transition_config_t,
+) -> Option<vulkan::TransitionPresentation> {
+    use sys::waywallen_transition_kind_t as Kind;
+    let shape = match config.kind {
+        Kind::WAYWALLEN_TRANSITION_KIND_NONE => return None,
+        Kind::WAYWALLEN_TRANSITION_KIND_FADE => vulkan::TransitionShape::Fade,
+        Kind::WAYWALLEN_TRANSITION_KIND_WIPE => vulkan::TransitionShape::Wipe {
+            angle: config.angle,
+        },
+        Kind::WAYWALLEN_TRANSITION_KIND_GROW => vulkan::TransitionShape::Grow {
+            origin: [config.origin_x, config.origin_y],
+        },
+    };
+    Some(vulkan::TransitionPresentation {
+        shape,
+        duration: Duration::from_millis(u64::from(config.duration_ms)),
+    })
 }
 
 unsafe extern "C" fn on_presentation_state(

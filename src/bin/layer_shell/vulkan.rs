@@ -15,10 +15,16 @@ const BLUR_WEIGHT_COUNT: usize = MAX_BLUR_MIP_LEVELS as usize;
 const COMPOSITION_PUSH_CONSTANT_SIZE: u32 = std::mem::size_of::<CompositionPushConstants>() as u32;
 const BLUR_PUSH_CONSTANT_SIZE: u32 = 8 * 4;
 const BLUR_PUSH_CONSTANT_OFFSET: u32 = COMPOSITION_PUSH_CONSTANT_SIZE;
-const TOTAL_PUSH_CONSTANT_SIZE: u32 = BLUR_PUSH_CONSTANT_OFFSET + BLUR_PUSH_CONSTANT_SIZE;
+const TRANSITION_PUSH_CONSTANT_SIZE: u32 = 8 * 4;
+const TRANSITION_PUSH_CONSTANT_OFFSET: u32 = BLUR_PUSH_CONSTANT_OFFSET + BLUR_PUSH_CONSTANT_SIZE;
+const TOTAL_PUSH_CONSTANT_SIZE: u32 =
+    TRANSITION_PUSH_CONSTANT_OFFSET + TRANSITION_PUSH_CONSTANT_SIZE;
 const RESOURCE_RETIRE_TIMEOUT_NS: u64 = 2_000_000_000;
 const SWAPCHAIN_ACQUIRE_TIMEOUT_NS: u64 = 1_000_000;
 const BLUR_TRANSITION_DURATION: Duration = Duration::from_millis(180);
+/// Soft edge of wipe and grow transitions, as a fraction of the travel distance.
+const TRANSITION_EDGE_FEATHER: f32 = 0.04;
+const TRANSITION_TARGET_COUNT: usize = 2;
 const _: () = assert!(COMPOSITION_PUSH_CONSTANT_SIZE == 48);
 const _: () = assert!(TOTAL_PUSH_CONSTANT_SIZE <= 128);
 
@@ -524,6 +530,120 @@ struct BlurSample {
     finished: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransitionShape {
+    Fade,
+    /// Degrees clockwise in surface space; 0 wipes left to right.
+    Wipe {
+        angle: u32,
+    },
+    /// Center in surface uv space.
+    Grow {
+        origin: [f32; 2],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransitionPresentation {
+    pub shape: TransitionShape,
+    pub duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveTransition {
+    presentation: TransitionPresentation,
+    started_at: Instant,
+}
+
+impl ActiveTransition {
+    /// Eased progress, or `None` once the transition has run its course.
+    fn progress_at(&self, now: Instant) -> Option<f32> {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if elapsed >= self.presentation.duration {
+            return None;
+        }
+        let linear = elapsed.as_secs_f32() / self.presentation.duration.as_secs_f32();
+        Some(ease_in_out_cubic(linear))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TransitionSample {
+    /// Shape and eased progress while a transition is still animating.
+    running: Option<(TransitionShape, f32)>,
+    /// The transition ended since the previous present.
+    finished: bool,
+}
+
+fn ease_in_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        let inverse = -2.0 * t + 2.0;
+        1.0 - inverse * inverse * inverse / 2.0
+    }
+}
+
+/// Fragment push constants for `transition.frag`: progress, shape and feather,
+/// then the shape geometry expressed in uv space for this output extent.
+fn transition_push_constants(
+    shape: TransitionShape,
+    progress: f32,
+    extent: vk::Extent2D,
+) -> [f32; 8] {
+    let width = extent.width.max(1) as f32;
+    let height = extent.height.max(1) as f32;
+    let corners = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+    match shape {
+        TransitionShape::Fade => [
+            progress,
+            0.0,
+            TRANSITION_EDGE_FEATHER,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        TransitionShape::Wipe { angle } => {
+            let radians = (angle % 360) as f32 * std::f32::consts::PI / 180.0;
+            let gradient = [width * radians.cos(), height * radians.sin()];
+            let travelled = corners.map(|[u, v]| u * gradient[0] + v * gradient[1]);
+            let start = travelled.iter().copied().fold(f32::INFINITY, f32::min);
+            let end = travelled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let span = (end - start).max(f32::EPSILON);
+            [
+                progress,
+                1.0,
+                TRANSITION_EDGE_FEATHER,
+                0.0,
+                gradient[0] / span,
+                gradient[1] / span,
+                -start / span,
+                0.0,
+            ]
+        }
+        TransitionShape::Grow { origin } => {
+            let [x, y] = origin.map(|value| value.clamp(0.0, 1.0));
+            let reach = corners
+                .iter()
+                .map(|[u, v]| ((u - x) * width).hypot((v - y) * height))
+                .fold(1.0, f32::max);
+            [
+                progress,
+                2.0,
+                TRANSITION_EDGE_FEATHER,
+                0.0,
+                x,
+                y,
+                width / reach,
+                height / reach,
+            ]
+        }
+    }
+}
+
 fn needs_persistent_scene(
     available: bool,
     presentation: PausePresentation,
@@ -620,6 +740,7 @@ fn interpolate_blur(segment: BlurSegment, elapsed: Duration) -> f32 {
 struct BlurResources {
     image: vk::Image,
     memory: vk::DeviceMemory,
+    format: vk::Format,
     all_levels_view: vk::ImageView,
     mip_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
@@ -633,6 +754,29 @@ struct BlurResources {
     base_valid: bool,
     pyramid_valid: bool,
     pyramid_dirty: bool,
+}
+
+struct TransitionTarget {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
+    /// Binding 1 samples the scene, binding 2 samples this target.
+    descriptor_set: vk::DescriptorSet,
+}
+
+/// Scene-sized copies of outgoing content. Starting a transition renders what
+/// is on screen into the spare target, so interrupting a running transition
+/// continues from its current mix instead of jumping.
+struct TransitionResources {
+    targets: Vec<TransitionTarget>,
+    /// Target that holds the outgoing content.
+    front: usize,
+    /// Renders the on-screen mix of a running transition into a target.
+    capture_pipeline: vk::Pipeline,
+    /// Renders the plain scene into a target; the outgoing target may be unwritten.
+    capture_scene_pipeline: vk::Pipeline,
+    output_pipeline: vk::Pipeline,
 }
 
 struct DirectBinding {
@@ -733,6 +877,11 @@ pub struct WsiPresenter {
     blur_transition: BlurTransition,
     blur_resources: Option<BlurResources>,
     pause_blur_available: bool,
+    transition_presentation: Option<TransitionPresentation>,
+    transition_armed: bool,
+    active_transition: Option<ActiveTransition>,
+    transition_resources: Option<TransitionResources>,
+    transitions_available: bool,
     direct_binding: Option<DirectBinding>,
     pending_direct_frame: Option<DirectFrame>,
     blank_state: BlankState,
@@ -774,6 +923,11 @@ impl WsiPresenter {
             blur_transition: BlurTransition::default(),
             blur_resources: None,
             pause_blur_available: true,
+            transition_presentation: None,
+            transition_armed: false,
+            active_transition: None,
+            transition_resources: None,
+            transitions_available: true,
             direct_binding: None,
             pending_direct_frame: None,
             blank_state: BlankState::Inactive,
@@ -796,6 +950,11 @@ impl WsiPresenter {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let descriptor_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_binding);
@@ -805,13 +964,14 @@ impl WsiPresenter {
                 .create_descriptor_set_layout(&descriptor_layout_info, None)
         }
         .context("vkCreateDescriptorSetLayout")?;
+        let max_sets = FRAMES_IN_FLIGHT + MAX_BLUR_MIP_LEVELS as usize + TRANSITION_TARGET_COUNT;
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: ((FRAMES_IN_FLIGHT + MAX_BLUR_MIP_LEVELS as usize) * 2) as u32,
+            descriptor_count: (max_sets * descriptor_binding.len()) as u32,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(FRAMES_IN_FLIGHT as u32 + MAX_BLUR_MIP_LEVELS)
+            .max_sets(max_sets as u32)
             .pool_sizes(&pool_sizes);
         self.descriptor_pool =
             unsafe { self.runtime.device.create_descriptor_pool(&pool_info, None) }
@@ -830,7 +990,7 @@ impl WsiPresenter {
             vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                 .offset(BLUR_PUSH_CONSTANT_OFFSET)
-                .size(BLUR_PUSH_CONSTANT_SIZE),
+                .size(BLUR_PUSH_CONSTANT_SIZE + TRANSITION_PUSH_CONSTANT_SIZE),
         ];
         let layouts = [self.descriptor_set_layout];
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -914,6 +1074,32 @@ impl WsiPresenter {
 
     pub fn supports_pause_blur(&self) -> bool {
         self.pause_blur_available
+    }
+
+    /// Transitions draw from the same persistent scene as Pause Blur.
+    pub fn supports_transitions(&self) -> bool {
+        self.pause_blur_available && self.transitions_available
+    }
+
+    /// Returns true when the surface must be presented again to drop an
+    /// in-flight transition.
+    pub fn apply_transition_snapshot(
+        &mut self,
+        presentation: Option<TransitionPresentation>,
+    ) -> bool {
+        self.transition_presentation = presentation;
+        if presentation.is_some() {
+            return false;
+        }
+        self.transition_armed = false;
+        self.active_transition.take().is_some()
+    }
+
+    /// The next presented frame replaces different wallpaper content.
+    pub fn arm_transition(&mut self) {
+        if self.transition_presentation.is_some() {
+            self.transition_armed = true;
+        }
     }
 
     pub fn has_direct_binding(&self) -> bool {
@@ -1091,6 +1277,9 @@ impl WsiPresenter {
         self.pause_presentation = PausePresentation::default();
         self.pause_presentation_initialized = false;
         self.blur_transition.reset();
+        self.transition_presentation = None;
+        self.transition_armed = false;
+        self.active_transition = None;
         if let Some(resources) = self.blur_resources.as_mut() {
             resources.base_valid = false;
             resources.pyramid_valid = false;
@@ -1111,6 +1300,24 @@ impl WsiPresenter {
         self.blank_state.abandon();
     }
 
+    /// Finished transitions stay recorded until a present submits the final
+    /// frame, so an early `Pending` return cannot strand a partial mix.
+    fn sample_transition(&self, now: Instant) -> TransitionSample {
+        let Some(active) = self.active_transition else {
+            return TransitionSample::default();
+        };
+        match active.progress_at(now) {
+            Some(progress) => TransitionSample {
+                running: Some((active.presentation.shape, progress)),
+                finished: false,
+            },
+            None => TransitionSample {
+                running: None,
+                finished: true,
+            },
+        }
+    }
+
     pub fn present(
         &mut self,
         display: Option<*mut sys::waywallen_display_t>,
@@ -1119,12 +1326,14 @@ impl WsiPresenter {
     ) -> Result<PresentResult> {
         let mut release_pending = self.drain_completed_releases(display)?;
         let blur = self.blur_transition.sample(now);
+        let transition = self.sample_transition(now);
         let scene_path = needs_persistent_scene(
             self.pause_blur_available,
             self.pause_presentation,
             &blur,
             self.blur_resources.is_some(),
-        );
+        ) || (self.supports_transitions()
+            && (self.transition_presentation.is_some() || self.active_transition.is_some()));
         if !scene_path && self.blur_resources.is_some() {
             if !self.frames_idle()? {
                 return Ok(PresentResult::Pending);
@@ -1169,11 +1378,48 @@ impl WsiPresenter {
                 }
             }
         }
+        let start_transition = pending_direct.is_some()
+            && self.transition_armed
+            && self.transition_presentation.is_some()
+            && self.supports_transitions()
+            && self
+                .blur_resources
+                .as_ref()
+                .is_some_and(|resources| resources.base_valid);
+        if start_transition && self.transition_resources.is_none() {
+            match self.create_transition_resources() {
+                Ok(resources) => self.transition_resources = Some(resources),
+                Err(error) => {
+                    self.transitions_available = false;
+                    log::warn!(
+                        "wallpaper transitions disabled for {}x{} {:?}: {error:#}",
+                        self.extent.width,
+                        self.extent.height,
+                        self.format
+                    );
+                }
+            }
+        }
+        let start_transition = start_transition && self.transition_resources.is_some();
+        let outgoing_target = self.transition_resources.as_ref().map(|resources| {
+            if start_transition {
+                (resources.front + 1) % resources.targets.len()
+            } else {
+                resources.front
+            }
+        });
+        let output_transition = if start_transition {
+            self.transition_presentation
+                .map(|presentation| (presentation.shape, 0.0))
+        } else {
+            transition.running
+        };
         let scene_valid = self
             .blur_resources
             .as_ref()
             .is_some_and(|resources| resources.base_valid);
-        let scene_redraw = needs_scene_redraw(scene_path, scene_valid, &blur, swapchain_recreated);
+        let scene_redraw = needs_scene_redraw(scene_path, scene_valid, &blur, swapchain_recreated)
+            || (scene_path && scene_valid && (transition.running.is_some() || transition.finished));
         if pending_direct.is_none() && !scene_redraw && !blank_pending {
             return Ok(PresentResult::Presented {
                 redraw: release_pending,
@@ -1326,6 +1572,89 @@ impl WsiPresenter {
             }
             if scene_path {
                 let resources = self.blur_resources.as_ref().unwrap();
+                if start_transition {
+                    // Copy what is on screen before the new frame overwrites the scene.
+                    let transitions = self.transition_resources.as_ref().unwrap();
+                    let capture_begin = vk::RenderPassBeginInfo::default()
+                        .render_pass(resources.render_pass)
+                        .framebuffer(transitions.targets[outgoing_target.unwrap()].framebuffer)
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: resources.extent,
+                        })
+                        .clear_values(&clear);
+                    self.runtime.device.cmd_begin_render_pass(
+                        frame.command_buffer,
+                        &capture_begin,
+                        vk::SubpassContents::INLINE,
+                    );
+                    self.cmd_set_render_extent(frame.command_buffer, resources.extent);
+                    let levels = resources.mip_views.len() as u32;
+                    let weights = if resources.pyramid_valid {
+                        blur_weights(blur.radius, levels)
+                    } else {
+                        blur_weights(0.0, levels)
+                    };
+                    if let Some((shape, progress)) = transition.running {
+                        self.runtime.device.cmd_bind_pipeline(
+                            frame.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            transitions.capture_pipeline,
+                        );
+                        self.runtime.device.cmd_bind_descriptor_sets(
+                            frame.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.pipeline_layout,
+                            0,
+                            &[transitions.targets[transitions.front].descriptor_set],
+                            &[],
+                        );
+                        let push = transition_output_push_constants(
+                            weights,
+                            transition_push_constants(shape, progress, resources.extent),
+                        );
+                        self.runtime.device.cmd_push_constants(
+                            frame.command_buffer,
+                            self.pipeline_layout,
+                            vk::ShaderStageFlags::FRAGMENT,
+                            BLUR_PUSH_CONSTANT_OFFSET,
+                            std::slice::from_raw_parts(
+                                push.as_ptr().cast::<u8>(),
+                                std::mem::size_of_val(&push),
+                            ),
+                        );
+                    } else {
+                        self.runtime.device.cmd_bind_pipeline(
+                            frame.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            transitions.capture_scene_pipeline,
+                        );
+                        self.runtime.device.cmd_bind_descriptor_sets(
+                            frame.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.pipeline_layout,
+                            0,
+                            &[resources.mix_descriptor_set],
+                            &[],
+                        );
+                        self.runtime.device.cmd_push_constants(
+                            frame.command_buffer,
+                            self.pipeline_layout,
+                            vk::ShaderStageFlags::FRAGMENT,
+                            BLUR_PUSH_CONSTANT_OFFSET,
+                            std::slice::from_raw_parts(
+                                weights.as_ptr().cast::<u8>(),
+                                std::mem::size_of_val(&weights),
+                            ),
+                        );
+                    }
+                    self.runtime
+                        .device
+                        .cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+                    self.runtime
+                        .device
+                        .cmd_end_render_pass(frame.command_buffer);
+                }
                 if let Some(push_bytes) = composition_push_bytes {
                     let scene_begin = vk::RenderPassBeginInfo::default()
                         .render_pass(resources.render_pass)
@@ -1434,32 +1763,63 @@ impl WsiPresenter {
                     &swapchain_begin,
                     vk::SubpassContents::INLINE,
                 );
-                self.runtime.device.cmd_bind_pipeline(
-                    frame.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    resources.blur_pipeline,
-                );
                 self.cmd_set_render_extent(frame.command_buffer, self.extent);
-                self.runtime.device.cmd_bind_descriptor_sets(
-                    frame.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
-                    0,
-                    &[resources.mix_descriptor_set],
-                    &[],
-                );
                 let blur_push = blur_weights(blur.radius, resources.mip_views.len() as u32);
-                let blur_bytes = std::slice::from_raw_parts(
-                    blur_push.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(&blur_push),
-                );
-                self.runtime.device.cmd_push_constants(
-                    frame.command_buffer,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::FRAGMENT,
-                    BLUR_PUSH_CONSTANT_OFFSET,
-                    blur_bytes,
-                );
+                if let (Some((shape, progress)), Some(transitions)) =
+                    (output_transition, self.transition_resources.as_ref())
+                {
+                    self.runtime.device.cmd_bind_pipeline(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        transitions.output_pipeline,
+                    );
+                    self.runtime.device.cmd_bind_descriptor_sets(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipeline_layout,
+                        0,
+                        &[transitions.targets[outgoing_target.unwrap()].descriptor_set],
+                        &[],
+                    );
+                    let push = transition_output_push_constants(
+                        blur_push,
+                        transition_push_constants(shape, progress, self.extent),
+                    );
+                    self.runtime.device.cmd_push_constants(
+                        frame.command_buffer,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        BLUR_PUSH_CONSTANT_OFFSET,
+                        std::slice::from_raw_parts(
+                            push.as_ptr().cast::<u8>(),
+                            std::mem::size_of_val(&push),
+                        ),
+                    );
+                } else {
+                    self.runtime.device.cmd_bind_pipeline(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        resources.blur_pipeline,
+                    );
+                    self.runtime.device.cmd_bind_descriptor_sets(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipeline_layout,
+                        0,
+                        &[resources.mix_descriptor_set],
+                        &[],
+                    );
+                    self.runtime.device.cmd_push_constants(
+                        frame.command_buffer,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        BLUR_PUSH_CONSTANT_OFFSET,
+                        std::slice::from_raw_parts(
+                            blur_push.as_ptr().cast::<u8>(),
+                            std::mem::size_of_val(&blur_push),
+                        ),
+                    );
+                }
                 self.runtime
                     .device
                     .cmd_draw(frame.command_buffer, 3, 1, 0, 0);
@@ -1582,7 +1942,30 @@ impl WsiPresenter {
                 resources.pyramid_dirty = false;
             }
         }
+        if start_transition {
+            if let (Some(resources), Some(target)) =
+                (self.transition_resources.as_mut(), outgoing_target)
+            {
+                resources.front = target;
+            }
+            self.active_transition =
+                self.transition_presentation
+                    .map(|presentation| ActiveTransition {
+                        presentation,
+                        started_at: now,
+                    });
+            log::debug!(
+                "transition started: surface=0x{:x} presentation={:?} interrupted={:?}",
+                self.surface.as_raw(),
+                self.transition_presentation,
+                transition.running
+            );
+        } else if transition.finished {
+            self.active_transition = None;
+            log::debug!("transition finished: surface=0x{:x}", self.surface.as_raw());
+        }
         if pending_direct.is_some() {
+            self.transition_armed = false;
             let direct = self
                 .pending_direct_frame
                 .take()
@@ -1654,6 +2037,7 @@ impl WsiPresenter {
             !self.pause_presentation.configured && blur.finished && self.blur_resources.is_some();
         Ok(PresentResult::Presented {
             redraw: blur.animating
+                || output_transition.is_some()
                 || cleanup_pending
                 || release_pending
                 || self.blank_state == BlankState::Pending
@@ -1781,10 +2165,46 @@ impl WsiPresenter {
             None
         };
 
+        let new_transition_pipeline = if self.transition_resources.is_some() {
+            match self.create_pipeline(
+                new_render_pass,
+                FULLSCREEN_VERTEX_SHADER,
+                TRANSITION_FRAGMENT_SHADER,
+            ) {
+                Ok(pipeline) => Some(pipeline),
+                Err(error) => {
+                    if let Some(pipeline) = new_blur_pipeline {
+                        unsafe { self.runtime.device.destroy_pipeline(pipeline, None) };
+                    }
+                    self.destroy_swapchain_rendering_parts(
+                        new_views,
+                        new_render_pass,
+                        new_pipeline,
+                        new_framebuffers,
+                    );
+                    self.destroy_semaphores(new_present_ready);
+                    unsafe {
+                        self.runtime
+                            .swapchain_loader
+                            .destroy_swapchain(new_swapchain, None)
+                    };
+                    return Err(error.context("recreate transition output pipeline"));
+                }
+            }
+        } else {
+            None
+        };
+
         if let (Some(resources), Some(new_pipeline)) =
             (self.blur_resources.as_mut(), new_blur_pipeline)
         {
             let old_pipeline = std::mem::replace(&mut resources.blur_pipeline, new_pipeline);
+            unsafe { self.runtime.device.destroy_pipeline(old_pipeline, None) };
+        }
+        if let (Some(resources), Some(new_pipeline)) =
+            (self.transition_resources.as_mut(), new_transition_pipeline)
+        {
+            let old_pipeline = std::mem::replace(&mut resources.output_pipeline, new_pipeline);
             unsafe { self.runtime.device.destroy_pipeline(old_pipeline, None) };
         }
         self.destroy_swapchain_rendering();
@@ -1975,6 +2395,7 @@ impl WsiPresenter {
         let mut resources = BlurResources {
             image: vk::Image::null(),
             memory: vk::DeviceMemory::null(),
+            format,
             all_levels_view: vk::ImageView::null(),
             mip_views: Vec::with_capacity(mip_levels as usize),
             render_pass: vk::RenderPass::null(),
@@ -2246,8 +2667,208 @@ impl WsiPresenter {
     }
 
     fn destroy_current_blur_resources(&mut self) {
+        // Transition targets sample the scene, so they never outlive it.
+        self.active_transition = None;
+        if let Some(resources) = self.transition_resources.take() {
+            self.destroy_transition_resources(resources);
+        }
         if let Some(resources) = self.blur_resources.take() {
             self.destroy_blur_resources(resources);
+        }
+    }
+
+    fn create_transition_resources(&self) -> Result<TransitionResources> {
+        let scene = self
+            .blur_resources
+            .as_ref()
+            .ok_or_else(|| anyhow!("transition targets require a persistent scene"))?;
+        let mut resources = TransitionResources {
+            targets: Vec::with_capacity(TRANSITION_TARGET_COUNT),
+            front: 0,
+            capture_pipeline: vk::Pipeline::null(),
+            capture_scene_pipeline: vk::Pipeline::null(),
+            output_pipeline: vk::Pipeline::null(),
+        };
+        let create = (|| -> Result<()> {
+            for index in 0..TRANSITION_TARGET_COUNT {
+                let mut target = TransitionTarget {
+                    image: vk::Image::null(),
+                    memory: vk::DeviceMemory::null(),
+                    view: vk::ImageView::null(),
+                    framebuffer: vk::Framebuffer::null(),
+                    descriptor_set: vk::DescriptorSet::null(),
+                };
+                let result = self.create_transition_target(scene, &mut target);
+                resources.targets.push(target);
+                result.with_context(|| format!("create transition target {index}"))?;
+            }
+            resources.capture_pipeline = self.create_pipeline(
+                scene.render_pass,
+                FULLSCREEN_VERTEX_SHADER,
+                TRANSITION_FRAGMENT_SHADER,
+            )?;
+            resources.capture_scene_pipeline = self.create_pipeline(
+                scene.render_pass,
+                FULLSCREEN_VERTEX_SHADER,
+                BLUR_FRAGMENT_SHADER,
+            )?;
+            resources.output_pipeline = self.create_pipeline(
+                self.render_pass,
+                FULLSCREEN_VERTEX_SHADER,
+                TRANSITION_FRAGMENT_SHADER,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = create {
+            self.destroy_transition_resources(resources);
+            return Err(error);
+        }
+        log::debug!(
+            "transition targets ready: {}x{} format={:?}",
+            scene.extent.width,
+            scene.extent.height,
+            scene.format
+        );
+        Ok(resources)
+    }
+
+    fn create_transition_target(
+        &self,
+        scene: &BlurResources,
+        target: &mut TransitionTarget,
+    ) -> Result<()> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(scene.format)
+            .extent(vk::Extent3D {
+                width: scene.extent.width,
+                height: scene.extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        target.image = unsafe { self.runtime.device.create_image(&image_info, None) }
+            .context("create transition image")?;
+        let requirements = unsafe {
+            self.runtime
+                .device
+                .get_image_memory_requirements(target.image)
+        };
+        let memory_type = self
+            .find_memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| anyhow!("no device-local memory for transition image"))?;
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        target.memory = unsafe { self.runtime.device.allocate_memory(&allocate, None) }
+            .context("allocate transition image")?;
+        unsafe {
+            self.runtime
+                .device
+                .bind_image_memory(target.image, target.memory, 0)
+        }
+        .context("bind transition image")?;
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(target.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(scene.format)
+            .subresource_range(full_color_range());
+        target.view = unsafe { self.runtime.device.create_image_view(&view_info, None) }
+            .context("create transition image view")?;
+        let attachments = [target.view];
+        let framebuffer_info = vk::FramebufferCreateInfo::default()
+            .render_pass(scene.render_pass)
+            .attachments(&attachments)
+            .width(scene.extent.width)
+            .height(scene.extent.height)
+            .layers(1);
+        target.framebuffer = unsafe {
+            self.runtime
+                .device
+                .create_framebuffer(&framebuffer_info, None)
+        }
+        .context("create transition framebuffer")?;
+        let set_layouts = [self.descriptor_set_layout];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        target.descriptor_set =
+            unsafe { self.runtime.device.allocate_descriptor_sets(&allocate_info) }
+                .context("allocate transition descriptor set")?[0];
+        let scene_info = [vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(scene.all_levels_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let outgoing_info = [vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(target.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(target.descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&scene_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(target.descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&outgoing_info),
+        ];
+        unsafe { self.runtime.device.update_descriptor_sets(&writes, &[]) };
+        Ok(())
+    }
+
+    fn destroy_transition_resources(&self, resources: TransitionResources) {
+        unsafe {
+            let descriptor_sets = resources
+                .targets
+                .iter()
+                .map(|target| target.descriptor_set)
+                .filter(|set| *set != vk::DescriptorSet::null())
+                .collect::<Vec<_>>();
+            if !descriptor_sets.is_empty() {
+                if let Err(error) = self
+                    .runtime
+                    .device
+                    .free_descriptor_sets(self.descriptor_pool, &descriptor_sets)
+                {
+                    log::warn!("free transition descriptor sets failed: {error:?}");
+                }
+            }
+            for pipeline in [
+                resources.capture_pipeline,
+                resources.capture_scene_pipeline,
+                resources.output_pipeline,
+            ] {
+                if pipeline != vk::Pipeline::null() {
+                    self.runtime.device.destroy_pipeline(pipeline, None);
+                }
+            }
+            for target in resources.targets {
+                if target.framebuffer != vk::Framebuffer::null() {
+                    self.runtime
+                        .device
+                        .destroy_framebuffer(target.framebuffer, None);
+                }
+                if target.view != vk::ImageView::null() {
+                    self.runtime.device.destroy_image_view(target.view, None);
+                }
+                if target.image != vk::Image::null() {
+                    self.runtime.device.destroy_image(target.image, None);
+                }
+                if target.memory != vk::DeviceMemory::null() {
+                    self.runtime.device.free_memory(target.memory, None);
+                }
+            }
         }
     }
 
@@ -2709,6 +3330,13 @@ fn blur_weights(radius: f32, mip_levels: u32) -> [f32; 8] {
     weights
 }
 
+fn transition_output_push_constants(weights: [f32; 8], transition: [f32; 8]) -> [f32; 16] {
+    let mut push = [0.0; 16];
+    push[..8].copy_from_slice(&weights);
+    push[8..].copy_from_slice(&transition);
+    push
+}
+
 fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
     if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
         return vk::SurfaceFormatKHR {
@@ -3137,6 +3765,123 @@ mod tests {
         assert_eq!(choose_queue_families(&[1, 3], &[2, 3]), Some((3, 3)));
         assert_eq!(choose_queue_families(&[1], &[2]), Some((1, 2)));
         assert_eq!(choose_queue_families(&[], &[2]), None);
+    }
+
+    /// Mirrors `reveal()` in transition.frag for one uv sample.
+    fn reveal(push: [f32; 8], uv: [f32; 2]) -> f32 {
+        let [progress, shape, feather, _, a, b, c, d] = push;
+        if shape < 0.5 {
+            return progress;
+        }
+        let travelled = if shape < 1.5 {
+            uv[0] * a + uv[1] * b + c
+        } else {
+            ((uv[0] - a) * c).hypot((uv[1] - b) * d)
+        };
+        let edge = progress * (1.0 + feather);
+        let lower = edge - feather;
+        let t = ((travelled - lower) / (edge - lower)).clamp(0.0, 1.0);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    }
+
+    #[test]
+    fn transition_easing_is_symmetric_and_pinned_at_the_ends() {
+        assert_near(ease_in_out_cubic(0.0), 0.0);
+        assert_near(ease_in_out_cubic(0.5), 0.5);
+        assert_near(ease_in_out_cubic(1.0), 1.0);
+        assert_near(ease_in_out_cubic(0.25) + ease_in_out_cubic(0.75), 1.0);
+        assert_near(ease_in_out_cubic(-1.0), 0.0);
+        assert_near(ease_in_out_cubic(2.0), 1.0);
+    }
+
+    #[test]
+    fn transition_shapes_start_fully_outgoing_and_end_fully_incoming() {
+        let extent = vk::Extent2D {
+            width: 2560,
+            height: 1440,
+        };
+        let shapes = [
+            TransitionShape::Fade,
+            TransitionShape::Wipe { angle: 0 },
+            TransitionShape::Wipe { angle: 135 },
+            TransitionShape::Grow { origin: [0.5, 0.5] },
+            TransitionShape::Grow { origin: [0.0, 1.0] },
+        ];
+        let samples = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.3, 0.7]];
+        for shape in shapes {
+            for uv in samples {
+                assert_near(
+                    reveal(transition_push_constants(shape, 0.0, extent), uv),
+                    0.0,
+                );
+                assert_near(
+                    reveal(transition_push_constants(shape, 1.0, extent), uv),
+                    1.0,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wipe_angle_sets_the_direction_the_edge_travels() {
+        let extent = vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        };
+        let halfway =
+            |angle| transition_push_constants(TransitionShape::Wipe { angle }, 0.5, extent);
+        assert!(reveal(halfway(0), [0.1, 0.5]) > 0.99);
+        assert!(reveal(halfway(0), [0.9, 0.5]) < 0.01);
+        assert!(reveal(halfway(90), [0.5, 0.1]) > 0.99);
+        assert!(reveal(halfway(90), [0.5, 0.9]) < 0.01);
+        assert!(reveal(halfway(180), [0.9, 0.5]) > 0.99);
+        assert!(reveal(halfway(270), [0.5, 0.9]) > 0.99);
+    }
+
+    #[test]
+    fn grow_expands_from_its_origin_in_pixel_space() {
+        let extent = vk::Extent2D {
+            width: 3840,
+            height: 1080,
+        };
+        let push = transition_push_constants(
+            TransitionShape::Grow {
+                origin: [0.25, 0.5],
+            },
+            0.3,
+            extent,
+        );
+        assert!(reveal(push, [0.25, 0.5]) > 0.99);
+        assert!(reveal(push, [1.0, 0.0]) < 0.01);
+        // Equal pixel distance horizontally and vertically reveals equally.
+        let dx = 200.0 / extent.width as f32;
+        let dy = 200.0 / extent.height as f32;
+        assert_near(
+            reveal(push, [0.25 + dx, 0.5]),
+            reveal(push, [0.25, 0.5 + dy]),
+        );
+    }
+
+    #[test]
+    fn active_transition_completes_after_its_duration() {
+        let now = Instant::now();
+        let active = ActiveTransition {
+            presentation: TransitionPresentation {
+                shape: TransitionShape::Fade,
+                duration: Duration::from_millis(400),
+            },
+            started_at: now,
+        };
+        assert_near(active.progress_at(now).unwrap(), 0.0);
+        assert_near(
+            active
+                .progress_at(now + Duration::from_millis(200))
+                .unwrap(),
+            0.5,
+        );
+        assert!(active
+            .progress_at(now + Duration::from_millis(400))
+            .is_none());
     }
 
     #[test]
