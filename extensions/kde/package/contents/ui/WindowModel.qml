@@ -1,5 +1,6 @@
 import QtQuick
 import org.kde.taskmanager 0.1 as TaskManager
+import org.kde.kwindowsystem
 
 Item {
     id: wm
@@ -11,6 +12,10 @@ Item {
 
     readonly property int flags: _flags
     property int _flags: 0
+
+    // KWin keeps windows maximized/non-minimized while "Peek at Desktop" is
+    // active. Treat that state as an unobstructed desktop for auto-pause.
+    readonly property bool showingDesktop: KWindowSystem.showingDesktop
 
     // Debug-only snapshot of the windows that survived activity /
     // virtual-desktop / screen filtering. Consumed by the ShowDiagnostics
@@ -37,6 +42,7 @@ Item {
 
     Component.onCompleted: recompute()
     onScreenGeometryChanged: recompute()
+    onShowingDesktopChanged: recompute()
 
     function _role(idx, name) {
         return tasksModel.data(idx, TaskManager.AbstractTasksModel[name]);
@@ -76,6 +82,10 @@ Item {
                 f |= 4; // MAXIMIZED
             }
         }
+        // Peek at Desktop hides the windows visually without minimizing them.
+        // Suppress all window-state bits until the desktop is un-peeked.
+        if (showingDesktop) f = 0;
+
         if (f !== _flags) _flags = f;
         _windows = list;
     }
