@@ -18,8 +18,11 @@
 use core::ffi::{c_char, c_int, c_void};
 
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
-pub const WAYWALLEN_DISPLAY_PROTOCOL_VERSION: u32 = 8;
+pub const WAYWALLEN_DISPLAY_PROTOCOL_VERSION: u32 = 9;
 pub const WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR: u32 = 1 << 0;
+pub const WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION: u32 = 1 << 1;
+pub const WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION: u32 = 1 << 2;
+pub const WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION: u32 = 1 << 3;
 
 // -----------------------------------------------------------------------------
 // Return codes
@@ -176,6 +179,7 @@ pub struct waywallen_composition_config_t {
 pub struct waywallen_binding_t {
     pub textures: waywallen_textures_t,
     pub config: waywallen_composition_config_t,
+    pub transition: bool,
 }
 
 #[repr(C)]
@@ -245,6 +249,26 @@ pub struct waywallen_pause_effect_state_t {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum waywallen_transition_kind_t {
+    #[default]
+    WAYWALLEN_TRANSITION_KIND_NONE = 0,
+    WAYWALLEN_TRANSITION_KIND_FADE = 1,
+    WAYWALLEN_TRANSITION_KIND_WIPE = 2,
+    WAYWALLEN_TRANSITION_KIND_GROW = 3,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct waywallen_transition_config_t {
+    pub kind: waywallen_transition_kind_t,
+    pub duration_ms: u32,
+    pub angle: u32,
+    pub origin_x: f32,
+    pub origin_y: f32,
+}
+
+#[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct waywallen_presentation_capabilities_t {
     pub flags: u32,
@@ -255,6 +279,7 @@ pub struct waywallen_presentation_capabilities_t {
 pub struct waywallen_presentation_config_t {
     pub generation: u64,
     pub pause_effect: waywallen_pause_effect_config_t,
+    pub transition: waywallen_transition_config_t,
 }
 
 #[repr(C)]

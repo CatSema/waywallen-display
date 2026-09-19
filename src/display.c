@@ -304,15 +304,27 @@ static waywallen_disconnect_reason_t map_daemon_error_code(uint32_t code) {
 
 enum
 {
-    WW_PRESENTATION_BLUR_RADIUS_MIN     = 1,
-    WW_PRESENTATION_BLUR_RADIUS_MAX     = 64,
-    WW_PRESENTATION_BLUR_RADIUS_DEFAULT = 30,
+    WW_PRESENTATION_BLUR_RADIUS_MIN             = 1,
+    WW_PRESENTATION_BLUR_RADIUS_MAX             = 64,
+    WW_PRESENTATION_BLUR_RADIUS_DEFAULT         = 30,
+    WW_PRESENTATION_TRANSITION_DURATION_MIN     = 100,
+    WW_PRESENTATION_TRANSITION_DURATION_MAX     = 10000,
+    WW_PRESENTATION_TRANSITION_DURATION_DEFAULT = 500,
+    WW_PRESENTATION_TRANSITION_ANGLE_LIMIT      = 360,
 };
+
+#define WW_PRESENTATION_CAPS_KNOWN                                                        \
+    (WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR | WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION | \
+     WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION | WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION)
 
 static waywallen_presentation_snapshot_t presentation_reset_snapshot(void) {
     waywallen_presentation_snapshot_t presentation = { 0 };
     presentation.config.pause_effect.kind          = WAYWALLEN_PAUSE_EFFECT_KIND_NONE;
     presentation.config.pause_effect.blur.radius   = WW_PRESENTATION_BLUR_RADIUS_DEFAULT;
+    presentation.config.transition.kind            = WAYWALLEN_TRANSITION_KIND_NONE;
+    presentation.config.transition.duration_ms     = WW_PRESENTATION_TRANSITION_DURATION_DEFAULT;
+    presentation.config.transition.origin_x        = 0.5f;
+    presentation.config.transition.origin_y        = 0.5f;
     return presentation;
 }
 
@@ -322,7 +334,36 @@ static int  acknowledge_frame_release(waywallen_display_t* d, uint64_t buffer_ge
 static int resolve_frame_without_gpu(waywallen_display_t* d, int release_syncobj_fd,
                                      uint64_t buffer_generation, uint64_t seq, const char* context);
 
-static bool presentation_snapshot_valid(const waywallen_presentation_snapshot_t* presentation) {
+static bool transition_config_valid(const waywallen_transition_config_t* transition,
+                                    uint32_t                             presentation_caps) {
+    uint32_t required_cap = 0;
+    switch (transition->kind) {
+    case WAYWALLEN_TRANSITION_KIND_NONE: break;
+    case WAYWALLEN_TRANSITION_KIND_FADE:
+        required_cap = WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION;
+        break;
+    case WAYWALLEN_TRANSITION_KIND_WIPE:
+        required_cap = WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION;
+        break;
+    case WAYWALLEN_TRANSITION_KIND_GROW:
+        required_cap = WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION;
+        break;
+    default: return false;
+    }
+    /* The daemon only names kinds this host declared. */
+    if (required_cap != 0 && (presentation_caps & required_cap) == 0) return false;
+    if (transition->duration_ms < WW_PRESENTATION_TRANSITION_DURATION_MIN ||
+        transition->duration_ms > WW_PRESENTATION_TRANSITION_DURATION_MAX) {
+        return false;
+    }
+    if (transition->angle >= WW_PRESENTATION_TRANSITION_ANGLE_LIMIT) return false;
+    /* Written so NaN fails both comparisons. */
+    return transition->origin_x >= 0.0f && transition->origin_x <= 1.0f &&
+           transition->origin_y >= 0.0f && transition->origin_y <= 1.0f;
+}
+
+static bool presentation_snapshot_valid(const waywallen_presentation_snapshot_t* presentation,
+                                        uint32_t presentation_caps) {
     if (! presentation) return false;
     if (presentation->config.generation == 0 || presentation->state.generation == 0) {
         return false;
@@ -337,6 +378,9 @@ static bool presentation_snapshot_valid(const waywallen_presentation_snapshot_t*
     }
     if (effect->blur.radius < WW_PRESENTATION_BLUR_RADIUS_MIN ||
         effect->blur.radius > WW_PRESENTATION_BLUR_RADIUS_MAX) {
+        return false;
+    }
+    if (! transition_config_valid(&presentation->config.transition, presentation_caps)) {
         return false;
     }
     return effect->kind == WAYWALLEN_PAUSE_EFFECT_KIND_BLUR ||
@@ -647,7 +691,7 @@ static int enc_ack_unbind(const void* m, ww_buf_t* out) {
     return ww_req_ack_unbind_encode((const ww_req_ack_unbind_t*)m, out);
 }
 
-/* Consumer capability bits mirrored from the daemon's public v8 schema. */
+/* Consumer capability bits mirrored from the daemon's public v9 schema. */
 #define WW_MEM_HINT_DEVICE_LOCAL (1u << 0)
 #define WW_MEM_HINT_HOST_VISIBLE (1u << 1)
 #define WW_SYNC_SYNCOBJ_BINARY   (1u << 1)
@@ -1322,7 +1366,7 @@ int waywallen_display_set_drm_render_node(waywallen_display_t* d, uint32_t major
 int waywallen_display_set_presentation_caps(waywallen_display_t* d, uint32_t flags) {
     if (! d) return WAYWALLEN_ERR_INVAL;
     if (d->conn != WW_CONN_DISCONNECTED) return WAYWALLEN_ERR_STATE;
-    if (flags & ~WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR) return WAYWALLEN_ERR_INVAL;
+    if (flags & ~WW_PRESENTATION_CAPS_KNOWN) return WAYWALLEN_ERR_INVAL;
     d->presentation_caps = flags;
     return WAYWALLEN_OK;
 }
@@ -1647,7 +1691,7 @@ static int hs_advance_one(waywallen_display_t* d) {
             return WAYWALLEN_ERR_PROTO;
         }
         d->display_id = accepted.display_id;
-        if (! presentation_snapshot_valid(&accepted.presentation)) {
+        if (! presentation_snapshot_valid(&accepted.presentation, d->presentation_caps)) {
             ww_evt_display_accepted_free(&accepted);
             fire_disconnected_r(d,
                                 WAYWALLEN_DISCONNECT_HANDSHAKE_FAILED,
@@ -2308,16 +2352,24 @@ static int handle_bind_buffers(waywallen_display_t* d, const uint8_t* body, size
         fire_disconnected(d, WAYWALLEN_ERR_PROTO, "invalid initial composition config");
         return WAYWALLEN_ERR_PROTO;
     }
+    if (bb.transition && d->presentation.config.transition.kind == WAYWALLEN_TRANSITION_KIND_NONE) {
+        close_all_fds(fd_buf, n_fds);
+        ww_evt_bind_buffers_free(&bb);
+        fire_disconnected(
+            d, WAYWALLEN_ERR_PROTO, "bind_buffers transition without a transition kind");
+        return WAYWALLEN_ERR_PROTO;
+    }
     ww_log(WAYWALLEN_LOG_INFO,
            "bind_buffers received gen=%" PRIu64 " count=%u %ux%u "
-           "fourcc=0x%08x modifier=0x%" PRIx64 " planes_per_buffer=%u",
+           "fourcc=0x%08x modifier=0x%" PRIx64 " planes_per_buffer=%u transition=%d",
            bb.buffer_generation,
            bb.count,
            bb.width,
            bb.height,
            bb.fourcc,
            bb.modifier,
-           bb.planes_per_buffer);
+           bb.planes_per_buffer,
+           bb.transition ? 1 : 0);
     uint32_t expected = bb.count * bb.planes_per_buffer;
     if ((size_t)expected != n_fds) {
         close_all_fds(fd_buf, n_fds);
@@ -2510,6 +2562,7 @@ static int handle_bind_buffers(waywallen_display_t* d, const uint8_t* body, size
     d->bound.generation             = bb.buffer_generation;
     d->bound.binding.textures       = textures;
     d->bound.binding.config         = bb.initial_config;
+    d->bound.binding.transition     = bb.transition;
     d->bound.valid                  = true;
     d->bound.phase                  = WW_STREAM_ACTIVE;
     d->last_config_generation       = bb.initial_config.generation;
@@ -2555,7 +2608,8 @@ static int handle_set_presentation_snapshot(waywallen_display_t* d, const uint8_
         fire_disconnected(d, WAYWALLEN_ERR_PROTO, "decode set_presentation_snapshot");
         return WAYWALLEN_ERR_PROTO;
     }
-    bool valid = d->has_presentation && presentation_snapshot_valid(&event.presentation) &&
+    bool valid = d->has_presentation &&
+                 presentation_snapshot_valid(&event.presentation, d->presentation_caps) &&
                  event.presentation.config.generation > d->presentation.config.generation &&
                  event.presentation.state.generation > d->presentation.state.generation;
     if (! valid) {
