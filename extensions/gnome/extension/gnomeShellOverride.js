@@ -116,7 +116,11 @@ export class GnomeShellOverride {
         this._readOverviewPrefs();
         this._overviewSettingsIds = [];
         if (this._settings) {
-            for (const key of ['overview-blur', 'overview-blur-strength']) {
+            for (const key of [
+                'overview-wallpaper',
+                'overview-blur',
+                'overview-blur-strength',
+            ]) {
                 this._overviewSettingsIds.push(
                     this._settings.connect(`changed::${key}`,
                         () => this._onOverviewPrefsChanged()));
@@ -130,6 +134,8 @@ export class GnomeShellOverride {
     }
 
     _readOverviewPrefs() {
+        this._overviewWallpaper =
+            this._settings?.get_boolean('overview-wallpaper') ?? true;
         this._overviewBlur = this._settings?.get_boolean('overview-blur') ?? true;
         this._overviewStrength = this._settings?.get_int('overview-blur-strength') ?? 30;
     }
@@ -142,7 +148,8 @@ export class GnomeShellOverride {
     }
 
     _applyOverviewBlur(controller) {
-        const enabled = this._overviewBlur && this._overviewStrength > 0;
+        const enabled = this._overviewWallpaper &&
+            this._overviewBlur && this._overviewStrength > 0;
         controller?.setState(enabled, enabled, this._overviewStrength);
     }
 
@@ -238,6 +245,11 @@ export class GnomeShellOverride {
     }
 
     _syncOverviewBackdrop() {
+        if (!this._overviewWallpaper) {
+            this._invalidateOverviewClones();
+            return;
+        }
+
         const group = this._overviewGroup;
 
         const actors = global.get_window_actors(false);

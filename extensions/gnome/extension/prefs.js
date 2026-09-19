@@ -52,6 +52,15 @@ export default class WaywallenPrefs extends ExtensionPreferences {
         const ovGroup = new Adw.PreferencesGroup({title: _('Overview')});
         page.add(ovGroup);
 
+        const wallpaperRow = new Adw.SwitchRow({
+            title: _('Show wallpaper behind overview'),
+            subtitle: _(
+                "Turn off to keep GNOME's solid frame around workspaces and the app grid."),
+        });
+        settings.bind('overview-wallpaper', wallpaperRow, 'active',
+            Gio.SettingsBindFlags.DEFAULT);
+        ovGroup.add(wallpaperRow);
+
         const blurRow = new Adw.SwitchRow({
             title: _('Blur overview background'),
             subtitle: _('Frosted-glass blur over the overview wallpaper.'),
@@ -70,10 +79,13 @@ export default class WaywallenPrefs extends ExtensionPreferences {
         });
         settings.bind('overview-blur-strength', strengthRow, 'value',
             Gio.SettingsBindFlags.DEFAULT);
-        const syncStrengthSensitive = () =>
-            strengthRow.set_sensitive(blurRow.active);
-        blurRow.connect('notify::active', syncStrengthSensitive);
-        syncStrengthSensitive();
+        const syncOverviewControls = () => {
+            blurRow.set_sensitive(wallpaperRow.active);
+            strengthRow.set_sensitive(wallpaperRow.active && blurRow.active);
+        };
+        wallpaperRow.connect('notify::active', syncOverviewControls);
+        blurRow.connect('notify::active', syncOverviewControls);
+        syncOverviewControls();
         ovGroup.add(strengthRow);
 
         // Linkage hint: the overview blur coexists with Blur my Shell and

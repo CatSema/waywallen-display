@@ -22,6 +22,15 @@
       <summary>Overlay connection / resolution / window-state on the wallpaper</summary>
     </key>
 
+    <key name="overview-wallpaper" type="b">
+      <default>true</default>
+      <summary>Show the wallpaper behind the overview</summary>
+      <description>
+        Show the live wallpaper behind the overview and app grid. Disable this
+        option to keep GNOME's original solid overview background.
+      </description>
+    </key>
+
     <key name="overview-blur" type="b">
       <default>true</default>
       <summary>Blur the overview background</summary>
