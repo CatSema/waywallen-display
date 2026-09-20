@@ -54,6 +54,9 @@ typedef enum
 {
     WW_PRESENTATION_CAPABILITY_NONE       = 0,
     WW_PRESENTATION_CAPABILITY_PAUSE_BLUR = 1u << 0,
+    WW_PRESENTATION_CAPABILITY_FADE       = 1u << 1,
+    WW_PRESENTATION_CAPABILITY_WIPE       = 1u << 2,
+    WW_PRESENTATION_CAPABILITY_GROW       = 1u << 3,
 } WwPresentationCapability;
 
 typedef enum
@@ -61,6 +64,14 @@ typedef enum
     WW_PAUSE_EFFECT_KIND_NONE = 0,
     WW_PAUSE_EFFECT_KIND_BLUR = 1,
 } WwPauseEffectKind;
+
+typedef enum
+{
+    WW_TRANSITION_KIND_NONE = 0,
+    WW_TRANSITION_KIND_FADE = 1,
+    WW_TRANSITION_KIND_WIPE = 2,
+    WW_TRANSITION_KIND_GROW = 3,
+} WwTransitionKind;
 
 #define WW_TYPE_DISPLAY (ww_display_get_type())
 G_DECLARE_FINAL_TYPE(WwDisplay, ww_display, WW, DISPLAY, GObject)

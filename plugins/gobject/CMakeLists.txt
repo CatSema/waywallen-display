@@ -8,13 +8,15 @@
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLIB2 REQUIRED IMPORTED_TARGET glib-2.0 gobject-2.0)
 pkg_check_modules(GIR REQUIRED gobject-introspection-1.0)
-pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
+pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4>=4.10)
 
 set(WW_GOBJECT_SOURCES
     ww-display.c
     ww-display.h
     ww-shadow-paintable.c
     ww-shadow-paintable.h
+    ww-presentation-widget.c
+    ww-presentation-widget.h
 )
 
 add_library(waywallen-gobject SHARED ${WW_GOBJECT_SOURCES})
@@ -33,7 +35,7 @@ target_include_directories(waywallen-gobject
 # ship alongside it in the GNOME zip.
 target_link_libraries(waywallen-gobject
     PUBLIC PkgConfig::GLIB2 PkgConfig::GTK4
-    PRIVATE waywallen_display_static
+    PRIVATE waywallen_display_static m
 )
 target_compile_options(waywallen-gobject PRIVATE -Wall -Wextra)
 
@@ -72,6 +74,8 @@ if(G_IR_SCANNER AND G_IR_COMPILER)
                 ${CMAKE_CURRENT_SOURCE_DIR}/ww-display.c
                 ${CMAKE_CURRENT_SOURCE_DIR}/ww-shadow-paintable.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/ww-shadow-paintable.c
+                ${CMAKE_CURRENT_SOURCE_DIR}/ww-presentation-widget.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/ww-presentation-widget.c
         DEPENDS waywallen-gobject
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         COMMENT "Scanning waywallen-gobject for GIR"
@@ -106,5 +110,5 @@ endif()
 
 install(TARGETS waywallen-gobject
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(FILES ww-display.h
+install(FILES ww-display.h ww-shadow-paintable.h ww-presentation-widget.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/waywallen-gobject)

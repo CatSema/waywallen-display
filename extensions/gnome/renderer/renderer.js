@@ -1,6 +1,7 @@
 #!/usr/bin/env -S gjs -m
 // One Gtk.ApplicationWindow per Gdk.Monitor; the wallpaper DMA-BUF is
-// presented through Waywallen.ShadowPaintable (C-side texture lifetime).
+// presented through Waywallen.PresentationWidget (C-side texture lifetime
+// and toolkit submission state).
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
@@ -117,12 +118,11 @@ class MonitorRenderer {
         this._displayName = opts.displayName.trim() || monitorDisplayName(monitor);
 
         this._window = null;
-        this._picture = null;
+        this._presentationWidget = null;
         this._display = null;
 
         this._inSourceId = 0;
         this._outSourceId = 0;
-        this._paintable = null;
 
         this._destroyed = false;
         this._presentation = null;
@@ -142,22 +142,15 @@ class MonitorRenderer {
         // get_monitor() stops being unique for per-monitor matching.
         this._updateWindowTitle();
 
-        // Pin the size: a minimized Wayland window gets no configure, so
-        // without an explicit request Gtk.Picture measures height as Infinity.
-        this._picture = new Gtk.Picture({
-            can_shrink: true,
-            content_fit: Gtk.ContentFit.FILL,
-            width_request: geom.width,
-            height_request: geom.height,
-        });
-        // Attach up front so the clear color fills before the first bind.
-        this._paintable = Waywallen.ShadowPaintable.new();
-        this._picture.set_paintable(this._paintable);
+        // Pin the size: a minimized Wayland window gets no configure, so the
+        // source widget needs an explicit logical allocation.
+        this._presentationWidget = Waywallen.PresentationWidget.new();
+        this._presentationWidget.set_size_request(geom.width, geom.height);
 
         if (this._opts.diagnostics)
             this._window.set_child(this._buildDiagOverlay());
         else
-            this._window.set_child(this._picture);
+            this._window.set_child(this._presentationWidget);
         this._window.set_default_size(geom.width, geom.height);
 
         this._window.connect('realize', () => this._onRealize());
@@ -175,7 +168,7 @@ class MonitorRenderer {
     _buildDiagOverlay() {
         ensureDiagCss();
         const overlay = new Gtk.Overlay();
-        overlay.set_child(this._picture);
+        overlay.set_child(this._presentationWidget);
         this._diagLabel = new Gtk.Label({
             halign: Gtk.Align.START,
             valign: Gtk.Align.START,
@@ -224,9 +217,9 @@ class MonitorRenderer {
             // implicit pointer grab from locking the user out.
             this._window.set_can_target(false);
             this._window.set_can_focus(false);
-            if (this._picture) {
-                this._picture.set_can_target(false);
-                this._picture.set_can_focus(false);
+            if (this._presentationWidget) {
+                this._presentationWidget.set_can_target(false);
+                this._presentationWidget.set_can_focus(false);
             }
             const surface = this._window.get_surface();
             if (surface?.set_input_region) {
@@ -248,15 +241,17 @@ class MonitorRenderer {
         const d = Waywallen.Display.new();
         if (!d.bind_dmabuf_relay())
             throw new Error('bind_dmabuf_relay failed');
-        if (!d.set_presentation_capabilities(Waywallen.PresentationCapability.PAUSE_BLUR))
+        const capabilities = Waywallen.PresentationCapability.PAUSE_BLUR |
+            Waywallen.PresentationCapability.FADE |
+            Waywallen.PresentationCapability.WIPE |
+            Waywallen.PresentationCapability.GROW;
+        if (!d.set_presentation_capabilities(capabilities))
             throw new Error('set_presentation_capabilities failed');
         this._display = d;
 
-        d.connect('binding-ready',
-            (_o, count, w, h, fourcc, modifier, backend,
-                sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca) =>
-                this._onBindingReady(count, w, h, fourcc, modifier, backend,
-                    sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca));
+        this._presentationWidget.connect('binding-staged',
+            (_o, count, w, h, fourcc, backend) =>
+                this._onBindingReady(count, w, h, fourcc, backend));
         // Register physical pixels (logical geometry × scale) so the producer
         // renders at native resolution, not the logical (half-res on HiDPI).
         const geom = this._monitor.get_geometry();
@@ -266,18 +261,17 @@ class MonitorRenderer {
         const ph = Math.round(geom.height * scale);
         this._pw = pw;
         this._ph = ph;
+        this._presentationWidget.set_display(d, scale);
 
-        d.connect('textures-releasing', () => this._onTexturesReleasing());
-        d.connect('composition-config',
-            (_o, sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca) =>
-                this._applyComposition(
-                    sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca));
         d.connect('frame-ready',
-            (_o, idx, seq, fd) => this._onFrameReady(idx, seq, fd));
+            (_o, bufferGeneration, idx, seq) =>
+                this._onFrameReady(bufferGeneration, idx, seq));
         d.connect('presentation-snapshot',
-            (_o, configGeneration, stateGeneration, kind, radius, active) =>
+            (_o, configGeneration, stateGeneration, kind, radius, active,
+                transitionKind, durationMs, angle, originX, originY) =>
                 this._onPresentationSnapshot(
-                    configGeneration, stateGeneration, kind, radius, active));
+                    configGeneration, stateGeneration, kind, radius, active,
+                    transitionKind, durationMs, angle, originX, originY));
         d.connect('presentation-state',
             (_o, stateGeneration, configGeneration, active) =>
                 this._onPresentationState(
@@ -337,17 +331,7 @@ class MonitorRenderer {
         return GLib.SOURCE_CONTINUE;
     }
 
-    _onBindingReady(count, w, h, fourcc, _modifier, backend,
-        sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca) {
-        const [ok, sfd, nPlanes, strides, offsets, smod] =
-            this._display.get_shadow_export();
-        if (!ok) {
-            logIndexed(this._index, 'get_shadow_export failed');
-            return;
-        }
-        // set_shadow takes ownership of the fd.
-        this._paintable.set_shadow(sfd, nPlanes, w, h, fourcc, smod,
-                                   strides, offsets);
+    _onBindingReady(count, w, h, fourcc, backend) {
         this._texW = w;
         this._texH = h;
         this._fourcc = fourcc;
@@ -355,29 +339,10 @@ class MonitorRenderer {
         logIndexed(this._index,
             `bound shadow ${w}x${h} fourcc=0x${fourcc.toString(16)} ` +
             `count=${count} backend=${backend}`);
-        this._applyComposition(
-            sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca);
     }
 
-    _applyComposition(sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca) {
-        const scale = this._scale || 1;
-        // Dest is physical display pixels; GTK widgets use logical pixels.
-        this._paintable?.set_composition(sx, sy, sw, sh,
-                                         dx / scale, dy / scale,
-                                         dw / scale, dh / scale,
-                                         transform, cr, cg, cb, ca);
-    }
-
-    _onTexturesReleasing() {
-        // Keep the last frame: the shadow survives the producer unbind, so
-        // not clearing avoids a white flash across a re-bind.
-    }
-
-    _onFrameReady(_idx, _seq, fd) {
-        if (fd >= 0)
-            Waywallen.Display.close_fd(fd);
+    _onFrameReady(_bufferGeneration, _idx, _seq) {
         this._frames = (this._frames ?? 0) + 1;
-        this._paintable?.refresh();
     }
 
     _controlGeometry() {
@@ -394,7 +359,8 @@ class MonitorRenderer {
         print(encodeControlFrame({geometry: this._controlGeometry(), ...frame}).trimEnd());
     }
 
-    _onPresentationSnapshot(configGeneration, stateGeneration, kind, radius, active) {
+    _onPresentationSnapshot(configGeneration, stateGeneration, kind, radius, active,
+        transitionKind, durationMs, angle, originX, originY) {
         if (configGeneration === 0) {
             this._presentation = null;
             this._presentationReady = false;
@@ -406,6 +372,12 @@ class MonitorRenderer {
             config: {
                 generation: configGeneration,
                 pauseEffect: {kind, blur: {radius}},
+                transition: {
+                    kind: transitionKind,
+                    durationMs,
+                    angle,
+                    origin: {x: originX, y: originY},
+                },
             },
             state: {
                 generation: stateGeneration,
@@ -485,7 +457,7 @@ class MonitorRenderer {
 
     _onDisconnected(code, msg) {
         logIndexed(this._index, `disconnected: code=${code} msg=${msg}`);
-        this._paintable?.clear();
+        this._presentationWidget?.clear();
         this._exit();  // extension respawns us
     }
 
@@ -512,11 +484,10 @@ class MonitorRenderer {
             GLib.source_remove(this._diagTimerId);
             this._diagTimerId = 0;
         }
-        if (this._picture)
-            this._picture.set_paintable(null);
-        if (this._paintable) {
-            this._paintable.clear();
-            this._paintable = null;
+        if (this._presentationWidget) {
+            this._presentationWidget.set_display(null, 1);
+            this._presentationWidget.clear();
+            this._presentationWidget = null;
         }
         if (this._display) {
             this._display.disconnect();

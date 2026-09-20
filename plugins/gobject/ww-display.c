@@ -17,12 +17,18 @@ struct _WwDisplay {
     guint             shadow_strides[4];
     guint64           shadow_offsets[4];
     guint64           shadow_modifier;
+    guint64           shadow_buffer_generation;
     gboolean          shadow_valid;
     WwPauseEffectKind pause_effect_kind;
     guint             blur_radius;
     gboolean          pause_effect_active;
     guint64           presentation_config_generation;
     guint64           presentation_state_generation;
+    WwTransitionKind  transition_kind;
+    guint             transition_duration_ms;
+    guint             transition_angle;
+    gdouble           transition_origin_x;
+    gdouble           transition_origin_y;
 };
 
 G_DEFINE_FINAL_TYPE(WwDisplay, ww_display, G_TYPE_OBJECT)
@@ -71,10 +77,11 @@ static void on_binding_ready_cb(void* user_data, const waywallen_binding_t* bind
     /* Snapshot the shadow descriptor while the textures_t is still
      * the lib's live copy. Always refresh — relay rebinds change the
      * shadow fd. */
-    self->shadow_valid    = FALSE;
-    self->shadow_fd       = t->shadow_dmabuf_fd;
-    self->shadow_n_planes = (guint)t->shadow_n_planes;
-    self->shadow_modifier = t->shadow_modifier;
+    self->shadow_valid             = FALSE;
+    self->shadow_fd                = t->shadow_dmabuf_fd;
+    self->shadow_n_planes          = (guint)t->shadow_n_planes;
+    self->shadow_modifier          = t->shadow_modifier;
+    self->shadow_buffer_generation = t->buffer_generation;
     for (guint i = 0; i < 4; i++) {
         self->shadow_strides[i] = (i < t->shadow_n_planes) ? (guint)t->shadow_strides[i] : 0u;
         self->shadow_offsets[i] = (i < t->shadow_n_planes) ? t->shadow_offsets[i] : 0ull;
@@ -85,6 +92,10 @@ static void on_binding_ready_cb(void* user_data, const waywallen_binding_t* bind
     g_signal_emit(self,
                   signals[SIGNAL_BINDING_READY],
                   0,
+                  (guint64)t->buffer_generation,
+                  (guint64)binding->content_token,
+                  (guint64)binding->presentation_config_generation,
+                  (guint64)c->generation,
                   (guint)t->count,
                   (guint)t->tex_width,
                   (guint)t->tex_height,
@@ -107,12 +118,14 @@ static void on_binding_ready_cb(void* user_data, const waywallen_binding_t* bind
 }
 
 static void on_textures_releasing_cb(void* user_data, const waywallen_textures_t* t) {
-    (void)t;
-    WwDisplay* self       = WW_DISPLAY(user_data);
-    self->shadow_valid    = FALSE;
-    self->shadow_fd       = -1;
-    self->shadow_n_planes = 0;
-    g_signal_emit(self, signals[SIGNAL_TEXTURES_RELEASING], 0);
+    WwDisplay* self = WW_DISPLAY(user_data);
+    if (self->shadow_buffer_generation == t->buffer_generation) {
+        self->shadow_valid             = FALSE;
+        self->shadow_fd                = -1;
+        self->shadow_n_planes          = 0;
+        self->shadow_buffer_generation = 0;
+    }
+    g_signal_emit(self, signals[SIGNAL_TEXTURES_RELEASING], 0, (guint64)t->buffer_generation);
 }
 
 static void on_composition_config_cb(void* user_data, const waywallen_composition_config_t* c) {
@@ -124,6 +137,8 @@ static void on_composition_config_cb(void* user_data, const waywallen_compositio
     g_signal_emit(self,
                   signals[SIGNAL_COMPOSITION_CONFIG],
                   0,
+                  (guint64)c->generation,
+                  (guint64)c->buffer_generation,
                   (gdouble)c->source_rect.x,
                   (gdouble)c->source_rect.y,
                   (gdouble)c->source_rect.w,
@@ -143,13 +158,16 @@ static void on_frame_ready_cb(void* user_data, const waywallen_frame_t* f) {
     WwDisplay* self = WW_DISPLAY(user_data);
     gint       fd   = f->release_syncobj_fd;
 
-    g_signal_emit(
-        self, signals[SIGNAL_FRAME_READY], 0, (guint)f->buffer_index, (guint64)f->seq, fd);
+    g_signal_emit(self,
+                  signals[SIGNAL_FRAME_READY],
+                  0,
+                  (guint64)f->buffer_generation,
+                  (guint)f->buffer_index,
+                  (guint64)f->seq,
+                  fd);
 
-    /* JS handler may have called ww_display_signal_release_syncobj(fd),
-     * which operates on a dup. The original fd hand-off semantics are
-     * "transfer to host" per the C ABI, so close it here unconditionally. */
-    if (fd >= 0) close(fd);
+    /* The signal preserves the C callback's transfer-to-host contract.
+     * The synchronous handler owns any non-negative fd. */
 }
 
 static void on_presentation_snapshot_cb(void*                                    user_data,
@@ -160,6 +178,11 @@ static void on_presentation_snapshot_cb(void*                                   
     self->pause_effect_active = presentation->state.pause_effect.active;
     self->presentation_config_generation = presentation->config.generation;
     self->presentation_state_generation  = presentation->state.generation;
+    self->transition_kind                = (WwTransitionKind)presentation->config.transition.kind;
+    self->transition_duration_ms         = presentation->config.transition.duration_ms;
+    self->transition_angle               = presentation->config.transition.angle;
+    self->transition_origin_x            = presentation->config.transition.origin_x;
+    self->transition_origin_y            = presentation->config.transition.origin_y;
     notify_presentation(self);
     g_signal_emit(self,
                   signals[SIGNAL_PRESENTATION_SNAPSHOT],
@@ -168,7 +191,12 @@ static void on_presentation_snapshot_cb(void*                                   
                   self->presentation_state_generation,
                   self->pause_effect_kind,
                   self->blur_radius,
-                  self->pause_effect_active);
+                  self->pause_effect_active,
+                  self->transition_kind,
+                  self->transition_duration_ms,
+                  self->transition_angle,
+                  self->transition_origin_x,
+                  self->transition_origin_y);
 }
 
 static void on_presentation_state_cb(void* user_data, const waywallen_presentation_state_t* state) {
@@ -269,7 +297,11 @@ static void ww_display_class_init(WwDisplayClass* klass) {
                                                  NULL,
                                                  NULL,
                                                  G_TYPE_NONE,
-                                                 19,
+                                                 23,
+                                                 G_TYPE_UINT64,
+                                                 G_TYPE_UINT64,
+                                                 G_TYPE_UINT64,
+                                                 G_TYPE_UINT64,
                                                  G_TYPE_UINT,
                                                  G_TYPE_UINT,
                                                  G_TYPE_UINT,
@@ -298,7 +330,8 @@ static void ww_display_class_init(WwDisplayClass* klass) {
                                                       NULL,
                                                       NULL,
                                                       G_TYPE_NONE,
-                                                      0);
+                                                      1,
+                                                      G_TYPE_UINT64);
 
     /* (src_x, src_y, src_w, src_h,
      *  dst_x, dst_y, dst_w, dst_h,
@@ -312,7 +345,9 @@ static void ww_display_class_init(WwDisplayClass* klass) {
                                                       NULL,
                                                       NULL,
                                                       G_TYPE_NONE,
-                                                      13,
+                                                      15,
+                                                      G_TYPE_UINT64,
+                                                      G_TYPE_UINT64,
                                                       G_TYPE_DOUBLE,
                                                       G_TYPE_DOUBLE,
                                                       G_TYPE_DOUBLE,
@@ -327,7 +362,7 @@ static void ww_display_class_init(WwDisplayClass* klass) {
                                                       G_TYPE_DOUBLE,
                                                       G_TYPE_DOUBLE);
 
-    /* (buffer_index, seq, release_syncobj_fd) */
+    /* (buffer_generation, buffer_index, seq, release_syncobj_fd) */
     signals[SIGNAL_FRAME_READY] = g_signal_new("frame-ready",
                                                G_TYPE_FROM_CLASS(klass),
                                                G_SIGNAL_RUN_LAST,
@@ -336,12 +371,14 @@ static void ww_display_class_init(WwDisplayClass* klass) {
                                                NULL,
                                                NULL,
                                                G_TYPE_NONE,
-                                               3,
+                                               4,
+                                               G_TYPE_UINT64,
                                                G_TYPE_UINT,
                                                G_TYPE_UINT64,
                                                G_TYPE_INT);
 
-    /* (config_generation, state_generation, kind, radius, active) */
+    /* (config_generation, state_generation, pause kind/radius/active,
+     *  transition kind/duration/angle/origin) */
     signals[SIGNAL_PRESENTATION_SNAPSHOT] = g_signal_new("presentation-snapshot",
                                                          G_TYPE_FROM_CLASS(klass),
                                                          G_SIGNAL_RUN_LAST,
@@ -350,12 +387,17 @@ static void ww_display_class_init(WwDisplayClass* klass) {
                                                          NULL,
                                                          NULL,
                                                          G_TYPE_NONE,
-                                                         5,
+                                                         10,
                                                          G_TYPE_UINT64,
                                                          G_TYPE_UINT64,
                                                          G_TYPE_UINT,
                                                          G_TYPE_UINT,
-                                                         G_TYPE_BOOLEAN);
+                                                         G_TYPE_BOOLEAN,
+                                                         G_TYPE_UINT,
+                                                         G_TYPE_UINT,
+                                                         G_TYPE_UINT,
+                                                         G_TYPE_DOUBLE,
+                                                         G_TYPE_DOUBLE);
 
     /* (state_generation, config_generation, active) */
     signals[SIGNAL_PRESENTATION_STATE] = g_signal_new("presentation-state",
@@ -396,14 +438,19 @@ static void ww_display_init(WwDisplay* self) {
         .on_disconnected          = on_disconnected_cb,
         .user_data                = self,
     };
-    self->handle            = waywallen_display_new(&cb);
-    self->connected         = FALSE;
-    self->shadow_fd         = -1;
-    self->shadow_n_planes   = 0;
-    self->shadow_modifier   = 0;
-    self->shadow_valid      = FALSE;
-    self->pause_effect_kind = WW_PAUSE_EFFECT_KIND_NONE;
-    self->blur_radius       = 30;
+    self->handle                   = waywallen_display_new(&cb);
+    self->connected                = FALSE;
+    self->shadow_fd                = -1;
+    self->shadow_n_planes          = 0;
+    self->shadow_modifier          = 0;
+    self->shadow_buffer_generation = 0;
+    self->shadow_valid             = FALSE;
+    self->pause_effect_kind        = WW_PAUSE_EFFECT_KIND_NONE;
+    self->blur_radius              = 30;
+    self->transition_kind          = WW_TRANSITION_KIND_NONE;
+    self->transition_duration_ms   = 400;
+    self->transition_origin_x      = 0.5;
+    self->transition_origin_y      = 0.5;
 }
 
 WwDisplay* ww_display_new(void) { return g_object_new(WW_TYPE_DISPLAY, NULL); }
@@ -559,6 +606,11 @@ void ww_display_disconnect(WwDisplay* self) {
         self->pause_effect_active            = FALSE;
         self->presentation_config_generation = 0;
         self->presentation_state_generation  = 0;
+        self->transition_kind                = WW_TRANSITION_KIND_NONE;
+        self->transition_duration_ms         = 400;
+        self->transition_angle               = 0;
+        self->transition_origin_x            = 0.5;
+        self->transition_origin_y            = 0.5;
         notify_presentation(self);
         g_signal_emit(self,
                       signals[SIGNAL_PRESENTATION_SNAPSHOT],
@@ -567,6 +619,11 @@ void ww_display_disconnect(WwDisplay* self) {
                       0,
                       WW_PAUSE_EFFECT_KIND_NONE,
                       30u,
-                      FALSE);
+                      FALSE,
+                      WW_TRANSITION_KIND_NONE,
+                      400u,
+                      0u,
+                      0.5,
+                      0.5);
     }
 }
