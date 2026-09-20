@@ -343,7 +343,8 @@ typedef struct ww_evt_bind_buffers_t {
     ww_array_u32_t plane_offset;
     ww_array_u64_t size;
     waywallen_composition_config_t initial_config;
-    bool transition;
+    uint64_t content_token;
+    uint64_t presentation_config_generation;
 } ww_evt_bind_buffers_t;
 
 typedef struct ww_evt_set_composition_config_t {

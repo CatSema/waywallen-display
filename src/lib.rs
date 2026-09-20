@@ -179,7 +179,8 @@ pub struct waywallen_composition_config_t {
 pub struct waywallen_binding_t {
     pub textures: waywallen_textures_t,
     pub config: waywallen_composition_config_t,
-    pub transition: bool,
+    pub content_token: u64,
+    pub presentation_config_generation: u64,
 }
 
 #[repr(C)]

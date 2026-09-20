@@ -2352,16 +2352,24 @@ static int handle_bind_buffers(waywallen_display_t* d, const uint8_t* body, size
         fire_disconnected(d, WAYWALLEN_ERR_PROTO, "invalid initial composition config");
         return WAYWALLEN_ERR_PROTO;
     }
-    if (bb.transition && d->presentation.config.transition.kind == WAYWALLEN_TRANSITION_KIND_NONE) {
+    if (bb.content_token == 0) {
+        close_all_fds(fd_buf, n_fds);
+        ww_evt_bind_buffers_free(&bb);
+        fire_disconnected(d, WAYWALLEN_ERR_PROTO, "bind_buffers content token is zero");
+        return WAYWALLEN_ERR_PROTO;
+    }
+    if (! d->has_presentation ||
+        bb.presentation_config_generation != d->presentation.config.generation) {
         close_all_fds(fd_buf, n_fds);
         ww_evt_bind_buffers_free(&bb);
         fire_disconnected(
-            d, WAYWALLEN_ERR_PROTO, "bind_buffers transition without a transition kind");
+            d, WAYWALLEN_ERR_PROTO, "bind_buffers presentation config generation mismatch");
         return WAYWALLEN_ERR_PROTO;
     }
     ww_log(WAYWALLEN_LOG_INFO,
            "bind_buffers received gen=%" PRIu64 " count=%u %ux%u "
-           "fourcc=0x%08x modifier=0x%" PRIx64 " planes_per_buffer=%u transition=%d",
+           "fourcc=0x%08x modifier=0x%" PRIx64 " planes_per_buffer=%u content_token=%" PRIu64
+           " presentation_config=%" PRIu64,
            bb.buffer_generation,
            bb.count,
            bb.width,
@@ -2369,7 +2377,8 @@ static int handle_bind_buffers(waywallen_display_t* d, const uint8_t* body, size
            bb.fourcc,
            bb.modifier,
            bb.planes_per_buffer,
-           bb.transition ? 1 : 0);
+           bb.content_token,
+           bb.presentation_config_generation);
     uint32_t expected = bb.count * bb.planes_per_buffer;
     if ((size_t)expected != n_fds) {
         close_all_fds(fd_buf, n_fds);
@@ -2559,15 +2568,16 @@ static int handle_bind_buffers(waywallen_display_t* d, const uint8_t* body, size
             ? bb.count
             : 0;
 #endif
-    d->bound.generation             = bb.buffer_generation;
-    d->bound.binding.textures       = textures;
-    d->bound.binding.config         = bb.initial_config;
-    d->bound.binding.transition     = bb.transition;
-    d->bound.valid                  = true;
-    d->bound.phase                  = WW_STREAM_ACTIVE;
-    d->last_config_generation       = bb.initial_config.generation;
-    d->has_last_config_generation   = true;
-    d->has_failed_buffer_generation = false;
+    d->bound.generation                             = bb.buffer_generation;
+    d->bound.binding.textures                       = textures;
+    d->bound.binding.config                         = bb.initial_config;
+    d->bound.binding.content_token                  = bb.content_token;
+    d->bound.binding.presentation_config_generation = bb.presentation_config_generation;
+    d->bound.valid                                  = true;
+    d->bound.phase                                  = WW_STREAM_ACTIVE;
+    d->last_config_generation                       = bb.initial_config.generation;
+    d->has_last_config_generation                   = true;
+    d->has_failed_buffer_generation                 = false;
 
     ww_evt_bind_buffers_free(&bb);
     if (d->cb.on_binding_ready) {

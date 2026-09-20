@@ -1300,7 +1300,8 @@ int ww_evt_bind_buffers_encode(const ww_evt_bind_buffers_t *m, ww_buf_t *out) {
     if ((rc = w_array_u32(out, &m->plane_offset))) return rc;
     if ((rc = w_array_u64(out, &m->size))) return rc;
     if ((rc = w_composition_config(out, &m->initial_config))) return rc;
-    if ((rc = w_bool(out, m->transition))) return rc;
+    if ((rc = w_u64(out, m->content_token))) return rc;
+    if ((rc = w_u64(out, m->presentation_config_generation))) return rc;
     return WW_OK;
 }
 
@@ -1319,7 +1320,8 @@ int ww_evt_bind_buffers_decode(const uint8_t *buf, size_t len, ww_evt_bind_buffe
     if ((rc = rd_array_u32(&r, &out->plane_offset))) goto fail;
     if ((rc = rd_array_u64(&r, &out->size))) goto fail;
     if ((rc = rd_composition_config(&r, &out->initial_config))) goto fail;
-    if ((rc = rd_bool(&r, &out->transition))) goto fail;
+    if ((rc = rd_u64(&r, &out->content_token))) goto fail;
+    if ((rc = rd_u64(&r, &out->presentation_config_generation))) goto fail;
     if (r.pos != r.len) {
         int rc2 = WW_ERR_TRAILING;
         (void)rc2;

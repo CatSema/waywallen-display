@@ -68,7 +68,8 @@ struct test_state {
     int  last_disconnect_code;
     char last_disconnect_msg[256];
 
-    bool                                   last_binding_transition;
+    uint64_t                               last_binding_content_token;
+    uint64_t                               last_binding_presentation_config_generation;
     uint64_t                               last_binding_buffer_generation;
     uint64_t                               last_composition_buffer_generation;
     uint64_t                               last_composition_generation;
@@ -103,11 +104,12 @@ struct test_state {
 static void cb_binding_ready(void* ud, const waywallen_binding_t* binding) {
     struct test_state* ts = (struct test_state*)ud;
     ts->on_binding_ready_count++;
-    ts->last_binding_transition            = binding->transition;
-    const waywallen_textures_t* t          = &binding->textures;
-    ts->last_binding_buffer_generation     = t->buffer_generation;
-    ts->last_composition_buffer_generation = binding->config.buffer_generation;
-    ts->last_composition_generation        = binding->config.generation;
+    ts->last_binding_content_token                  = binding->content_token;
+    ts->last_binding_presentation_config_generation = binding->presentation_config_generation;
+    const waywallen_textures_t* t                   = &binding->textures;
+    ts->last_binding_buffer_generation              = t->buffer_generation;
+    ts->last_composition_buffer_generation          = binding->config.buffer_generation;
+    ts->last_composition_generation                 = binding->config.generation;
 }
 static void cb_textures_releasing(void* ud, const waywallen_textures_t* t) {
     struct test_state* ts = (struct test_state*)ud;
@@ -486,8 +488,9 @@ static int receive_import_failure(int client_fd, struct test_state* ts) {
     return 0;
 }
 
-static int send_bind_buffers_with_transition(int client_fd, uint64_t buffer_generation,
-                                             uint64_t composition_generation, bool transition) {
+static int send_bind_buffers_with_content(int client_fd, uint64_t buffer_generation,
+                                          uint64_t composition_generation, uint64_t content_token,
+                                          uint64_t presentation_config_generation) {
     int dmabuf[2];
     if (pipe(dmabuf) != 0) return -1;
 
@@ -513,7 +516,8 @@ static int send_bind_buffers_with_transition(int client_fd, uint64_t buffer_gene
             .transform = 0,
             .clear_color = { .r = 0.1f, .g = 0.2f, .b = 0.3f, .a = 1.0f },
         },
-        .transition = transition,
+        .content_token = content_token,
+        .presentation_config_generation = presentation_config_generation,
     };
     ww_buf_t out;
     ww_buf_init(&out);
@@ -529,8 +533,8 @@ static int send_bind_buffers_with_transition(int client_fd, uint64_t buffer_gene
 
 static int send_bind_buffers(int client_fd, uint64_t buffer_generation,
                              uint64_t composition_generation) {
-    return send_bind_buffers_with_transition(
-        client_fd, buffer_generation, composition_generation, false);
+    return send_bind_buffers_with_content(
+        client_fd, buffer_generation, composition_generation, buffer_generation + 100, 1);
 }
 
 static int send_composition_config(int client_fd, uint64_t buffer_generation,
@@ -831,7 +835,7 @@ static int handler_transition_bind(int client_fd, struct test_state* ts) {
             false,
             transition_config(WAYWALLEN_TRANSITION_KIND_FADE)) != 0)
         return -1;
-    if (send_bind_buffers_with_transition(client_fd, 1, 1, true) != 0) return -1;
+    if (send_bind_buffers_with_content(client_fd, 1, 1, 77, 2) != 0) return -1;
     sleep_ms(50);
     return 0;
 }
@@ -851,9 +855,16 @@ static int handler_undeclared_transition_kind(int client_fd, struct test_state* 
     return 0;
 }
 
-static int handler_transition_bind_without_kind(int client_fd, struct test_state* ts) {
+static int handler_bind_with_unknown_presentation_config(int client_fd, struct test_state* ts) {
     if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
-    if (send_bind_buffers_with_transition(client_fd, 1, 1, true) != 0) return -1;
+    if (send_bind_buffers_with_content(client_fd, 1, 1, 77, 2) != 0) return -1;
+    sleep_ms(50);
+    return 0;
+}
+
+static int handler_bind_with_zero_content_token(int client_fd, struct test_state* ts) {
+    if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
+    if (send_bind_buffers_with_content(client_fd, 1, 1, 0, 1) != 0) return -1;
     sleep_ms(50);
     return 0;
 }
@@ -1180,7 +1191,7 @@ static void test_unknown_pause_effect_kind_is_protocol_error(void) {
     printf("  ok test_unknown_pause_effect_kind_is_protocol_error\n");
 }
 
-static void test_transition_bind_reaches_host(void) {
+static void test_content_binding_reaches_host(void) {
     struct test_state ts;
     ts_init(&ts);
     pthread_t srv = spawn_server(&ts, handler_transition_bind);
@@ -1194,16 +1205,17 @@ static void test_transition_bind_reaches_host(void) {
     assert(dispatch_next_event(d) == WAYWALLEN_OK); /* snapshot with fade */
     assert(ts.last_presentation.config.transition.kind == WAYWALLEN_TRANSITION_KIND_FADE);
     assert(ts.last_presentation.config.transition.duration_ms == 500);
-    assert(dispatch_next_event(d) == WAYWALLEN_OK); /* bind with transition */
+    assert(dispatch_next_event(d) == WAYWALLEN_OK); /* content binding */
     assert(ts.on_binding_ready_count == 1);
-    assert(ts.last_binding_transition);
+    assert(ts.last_binding_content_token == 77);
+    assert(ts.last_binding_presentation_config_generation == 2);
     assert(ts.on_disconnected_count == 0);
 
     waywallen_display_close(d);
     waywallen_display_free(d);
     pthread_join(srv, NULL);
     ts_teardown(&ts);
-    printf("  ok test_transition_bind_reaches_host\n");
+    printf("  ok test_content_binding_reaches_host\n");
 }
 
 static void test_undeclared_transition_kind_is_protocol_error(void) {
@@ -1226,10 +1238,10 @@ static void test_undeclared_transition_kind_is_protocol_error(void) {
     printf("  ok test_undeclared_transition_kind_is_protocol_error\n");
 }
 
-static void test_transition_bind_without_kind_is_protocol_error(void) {
+static void test_bind_with_unknown_presentation_config_is_protocol_error(void) {
     struct test_state ts;
     ts_init(&ts);
-    pthread_t srv = spawn_server(&ts, handler_transition_bind_without_kind);
+    pthread_t srv = spawn_server(&ts, handler_bind_with_unknown_presentation_config);
 
     waywallen_display_t* d = make_client(&ts);
     assert(begin_test_display(d, ts.sock_path, 1920, 1080) == WAYWALLEN_OK);
@@ -1237,13 +1249,32 @@ static void test_transition_bind_without_kind_is_protocol_error(void) {
     assert(dispatch_next_event(d) == WAYWALLEN_ERR_PROTO);
     assert(ts.on_binding_ready_count == 0);
     assert(ts.on_disconnected_count == 1);
-    assert(strcmp(ts.last_disconnect_msg, "bind_buffers transition without a transition kind") ==
+    assert(strcmp(ts.last_disconnect_msg, "bind_buffers presentation config generation mismatch") ==
            0);
 
     waywallen_display_free(d);
     pthread_join(srv, NULL);
     ts_teardown(&ts);
-    printf("  ok test_transition_bind_without_kind_is_protocol_error\n");
+    printf("  ok test_bind_with_unknown_presentation_config_is_protocol_error\n");
+}
+
+static void test_bind_with_zero_content_token_is_protocol_error(void) {
+    struct test_state ts;
+    ts_init(&ts);
+    pthread_t srv = spawn_server(&ts, handler_bind_with_zero_content_token);
+
+    waywallen_display_t* d = make_client(&ts);
+    assert(begin_test_display(d, ts.sock_path, 1920, 1080) == WAYWALLEN_OK);
+    assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+    assert(dispatch_next_event(d) == WAYWALLEN_ERR_PROTO);
+    assert(ts.on_binding_ready_count == 0);
+    assert(ts.on_disconnected_count == 1);
+    assert(strcmp(ts.last_disconnect_msg, "bind_buffers content token is zero") == 0);
+
+    waywallen_display_free(d);
+    pthread_join(srv, NULL);
+    ts_teardown(&ts);
+    printf("  ok test_bind_with_zero_content_token_is_protocol_error\n");
 }
 
 /* No backend bound → consumer_caps probe falls through to the
@@ -1706,9 +1737,10 @@ int main(void) {
     test_cross_generation_state_is_protocol_error();
     test_invalid_presentation_radius_is_protocol_error();
     test_unknown_pause_effect_kind_is_protocol_error();
-    test_transition_bind_reaches_host();
+    test_content_binding_reaches_host();
     test_undeclared_transition_kind_is_protocol_error();
-    test_transition_bind_without_kind_is_protocol_error();
+    test_bind_with_unknown_presentation_config_is_protocol_error();
+    test_bind_with_zero_content_token_is_protocol_error();
     test_consumer_caps_without_backend();
     test_partial_welcome();
     test_server_closes_during_welcome_wait();

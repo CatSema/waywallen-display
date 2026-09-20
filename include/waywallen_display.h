@@ -261,11 +261,12 @@ typedef struct waywallen_textures {
 typedef struct waywallen_binding {
     waywallen_textures_t           textures;
     waywallen_composition_config_t config;
-    /* The pool replaces different wallpaper content. Hosts that declared
-     * a transition capability keep presenting their last content and
-     * animate to this pool's first frame using the current presentation
-     * snapshot's transition config. Never set while that kind is NONE. */
-    bool transition;
+    /* Opaque equality token for logical wallpaper content. Pool and
+     * renderer replacement keep this token unchanged. */
+    uint64_t content_token;
+    /* Presentation config that was current when the daemon produced this
+     * binding. The library validates that it was already observed. */
+    uint64_t presentation_config_generation;
 } waywallen_binding_t;
 
 typedef struct waywallen_frame {

@@ -1849,14 +1849,15 @@ unsafe extern "C" fn on_binding_ready(
         return;
     }
     log::info!(
-        "[{}] Vulkan producer binding ready: generation={} count={} {}x{} fourcc=0x{:08x} transition={}",
+        "[{}] Vulkan producer binding ready: generation={} count={} {}x{} fourcc=0x{:08x} content_token={} presentation_config={}",
         binding.display_name,
         t.buffer_generation,
         t.count,
         t.tex_width,
         t.tex_height,
         t.fourcc,
-        ready.transition
+        ready.content_token,
+        ready.presentation_config_generation
     );
     let raw_images = std::slice::from_raw_parts(t.vk_images, t.count as usize);
     let images = raw_images
@@ -1866,6 +1867,8 @@ unsafe extern "C" fn on_binding_ready(
     let mut presenter = binding.presenter.lock().unwrap();
     if let Err(error) = presenter.install_direct_binding(
         t.buffer_generation,
+        ready.content_token,
+        ready.presentation_config_generation,
         vk::Extent2D {
             width: t.tex_width,
             height: t.tex_height,
@@ -1877,9 +1880,6 @@ unsafe extern "C" fn on_binding_ready(
             binding.display_name
         );
         return;
-    }
-    if ready.transition {
-        presenter.arm_transition();
     }
     drop(presenter);
     apply_composition_config(binding, &ready.config);
@@ -1990,7 +1990,8 @@ unsafe extern "C" fn on_presentation_snapshot(
     let changed = {
         let mut presenter = binding.presenter.lock().unwrap();
         let pause_changed = presenter.apply_pause_snapshot(target, Instant::now());
-        presenter.apply_transition_snapshot(transition) || pause_changed
+        presenter.apply_transition_snapshot(presentation.config.generation, transition)
+            || pause_changed
     };
     log::debug!(
         "[{}] Pause Effect snapshot cfg={} state={} configured={} active={} radius={} transition={:?}",

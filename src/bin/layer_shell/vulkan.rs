@@ -567,6 +567,32 @@ impl ActiveTransition {
     }
 }
 
+fn update_transition_snapshot(
+    configured: &mut Option<TransitionPresentation>,
+    prepared: &mut Option<TransitionPresentation>,
+    active: &mut Option<ActiveTransition>,
+    presentation: Option<TransitionPresentation>,
+) -> bool {
+    *configured = presentation;
+    if let Some(presentation) = presentation {
+        if prepared.is_some() {
+            *prepared = Some(presentation);
+        }
+        return false;
+    }
+    let prepared = prepared.take().is_some();
+    active.take().is_some() || prepared
+}
+
+fn retained_transition_sample(
+    prepared: Option<TransitionPresentation>,
+    running: Option<(TransitionShape, f32)>,
+) -> Option<(TransitionShape, f32)> {
+    prepared
+        .map(|presentation| (presentation.shape, 0.0))
+        .or(running)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct TransitionSample {
     /// Shape and eased progress while a transition is still animating.
@@ -781,10 +807,68 @@ struct TransitionResources {
 
 struct DirectBinding {
     generation: u64,
+    content_token: u64,
+    presentation_config_generation: u64,
     images: Vec<vk::Image>,
     views: Vec<vk::ImageView>,
     format: vk::Format,
     extent: vk::Extent2D,
+}
+
+#[derive(Default)]
+struct ContentPresentationState {
+    bound: Option<u64>,
+    submitted: Option<u64>,
+    committed: Option<u64>,
+}
+
+impl ContentPresentationState {
+    fn bind(&mut self, token: u64) -> bool {
+        debug_assert_ne!(token, 0);
+        self.bound = Some(token);
+        let cancels_uncommitted = self.committed == Some(token)
+            && self.submitted.is_some_and(|submitted| submitted != token);
+        if cancels_uncommitted {
+            self.submitted = None;
+        }
+        cancels_uncommitted
+    }
+
+    fn unbind(&mut self) {
+        self.bound = None;
+    }
+
+    fn should_transition(&self, configured: bool, retained_scene_valid: bool) -> bool {
+        configured
+            && retained_scene_valid
+            && self
+                .bound
+                .zip(self.committed)
+                .is_some_and(|(bound, committed)| bound != committed)
+            && self.submitted != self.bound
+    }
+
+    fn mark_submitted(&mut self) {
+        self.submitted = self.bound;
+    }
+
+    fn discard_submitted(&mut self) {
+        self.submitted = None;
+    }
+
+    fn has_submitted(&self) -> bool {
+        self.submitted.is_some()
+    }
+
+    fn present_accepted(&mut self) {
+        if let Some(token) = self.submitted.take() {
+            self.committed = Some(token);
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 struct DirectFrame {
@@ -878,7 +962,9 @@ pub struct WsiPresenter {
     blur_resources: Option<BlurResources>,
     pause_blur_available: bool,
     transition_presentation: Option<TransitionPresentation>,
-    transition_armed: bool,
+    presentation_config_generation: u64,
+    content_presentation: ContentPresentationState,
+    prepared_transition: Option<TransitionPresentation>,
     active_transition: Option<ActiveTransition>,
     transition_resources: Option<TransitionResources>,
     transitions_available: bool,
@@ -924,7 +1010,9 @@ impl WsiPresenter {
             blur_resources: None,
             pause_blur_available: true,
             transition_presentation: None,
-            transition_armed: false,
+            presentation_config_generation: 0,
+            content_presentation: ContentPresentationState::default(),
+            prepared_transition: None,
             active_transition: None,
             transition_resources: None,
             transitions_available: true,
@@ -1085,21 +1173,16 @@ impl WsiPresenter {
     /// in-flight transition.
     pub fn apply_transition_snapshot(
         &mut self,
+        config_generation: u64,
         presentation: Option<TransitionPresentation>,
     ) -> bool {
-        self.transition_presentation = presentation;
-        if presentation.is_some() {
-            return false;
-        }
-        self.transition_armed = false;
-        self.active_transition.take().is_some()
-    }
-
-    /// The next presented frame replaces different wallpaper content.
-    pub fn arm_transition(&mut self) {
-        if self.transition_presentation.is_some() {
-            self.transition_armed = true;
-        }
+        self.presentation_config_generation = config_generation;
+        update_transition_snapshot(
+            &mut self.transition_presentation,
+            &mut self.prepared_transition,
+            &mut self.active_transition,
+            presentation,
+        )
     }
 
     pub fn has_direct_binding(&self) -> bool {
@@ -1109,19 +1192,37 @@ impl WsiPresenter {
     pub fn install_direct_binding(
         &mut self,
         generation: u64,
+        content_token: u64,
+        presentation_config_generation: u64,
         extent: vk::Extent2D,
         images: &[vk::Image],
     ) -> Result<()> {
         if self.direct_binding.is_some() {
             bail!("replace direct binding before retiring its image views");
         }
+        if content_token == 0 {
+            bail!("direct binding has a zero content token");
+        }
+        if presentation_config_generation != self.presentation_config_generation {
+            bail!(
+                "direct binding references presentation config {}, current is {}",
+                presentation_config_generation,
+                self.presentation_config_generation
+            );
+        }
         self.direct_binding = Some(DirectBinding {
             generation,
+            content_token,
+            presentation_config_generation,
             images: images.to_vec(),
             views: vec![vk::ImageView::null(); images.len()],
             format: vk::Format::UNDEFINED,
             extent,
         });
+        if self.content_presentation.bind(content_token) {
+            self.prepared_transition = None;
+            self.active_transition = None;
+        }
         Ok(())
     }
 
@@ -1231,6 +1332,12 @@ impl WsiPresenter {
         }
         let release_result = self.drain_completed_releases(display);
         if let Some(binding) = self.direct_binding.take() {
+            log::trace!(
+                "retire direct binding: generation={} content_token={} presentation_config={}",
+                binding.generation,
+                binding.content_token,
+                binding.presentation_config_generation
+            );
             unsafe {
                 for view in binding.views {
                     if view != vk::ImageView::null() {
@@ -1239,6 +1346,7 @@ impl WsiPresenter {
                 }
             }
         }
+        self.content_presentation.unbind();
         discard_result?;
         release_result?;
         Ok(())
@@ -1278,7 +1386,9 @@ impl WsiPresenter {
         self.pause_presentation_initialized = false;
         self.blur_transition.reset();
         self.transition_presentation = None;
-        self.transition_armed = false;
+        self.presentation_config_generation = 0;
+        self.content_presentation.reset();
+        self.prepared_transition = None;
         self.active_transition = None;
         if let Some(resources) = self.blur_resources.as_mut() {
             resources.base_valid = false;
@@ -1333,7 +1443,10 @@ impl WsiPresenter {
             &blur,
             self.blur_resources.is_some(),
         ) || (self.supports_transitions()
-            && (self.transition_presentation.is_some() || self.active_transition.is_some()));
+            && (self.transition_presentation.is_some()
+                || self.prepared_transition.is_some()
+                || self.active_transition.is_some()
+                || self.content_presentation.has_submitted()));
         if !scene_path && self.blur_resources.is_some() {
             if !self.frames_idle()? {
                 return Ok(PresentResult::Pending);
@@ -1351,6 +1464,8 @@ impl WsiPresenter {
         }
 
         let blank_pending = self.blank_state == BlankState::Pending;
+        let retained_transition =
+            retained_transition_sample(self.prepared_transition, transition.running);
         let pending_direct = (!blank_pending)
             .then(|| self.pending_direct_frame.as_ref().map(direct_frame_handles))
             .flatten();
@@ -1379,13 +1494,13 @@ impl WsiPresenter {
             }
         }
         let start_transition = pending_direct.is_some()
-            && self.transition_armed
-            && self.transition_presentation.is_some()
             && self.supports_transitions()
-            && self
-                .blur_resources
-                .as_ref()
-                .is_some_and(|resources| resources.base_valid);
+            && self.content_presentation.should_transition(
+                self.transition_presentation.is_some(),
+                self.blur_resources
+                    .as_ref()
+                    .is_some_and(|resources| resources.base_valid),
+            );
         if start_transition && self.transition_resources.is_none() {
             match self.create_transition_resources() {
                 Ok(resources) => self.transition_resources = Some(resources),
@@ -1411,6 +1526,8 @@ impl WsiPresenter {
         let output_transition = if start_transition {
             self.transition_presentation
                 .map(|presentation| (presentation.shape, 0.0))
+        } else if let Some(presentation) = self.prepared_transition {
+            Some((presentation.shape, 0.0))
         } else {
             transition.running
         };
@@ -1419,7 +1536,11 @@ impl WsiPresenter {
             .as_ref()
             .is_some_and(|resources| resources.base_valid);
         let scene_redraw = needs_scene_redraw(scene_path, scene_valid, &blur, swapchain_recreated)
-            || (scene_path && scene_valid && (transition.running.is_some() || transition.finished));
+            || (scene_path
+                && scene_valid
+                && (transition.running.is_some()
+                    || transition.finished
+                    || self.content_presentation.has_submitted()));
         if pending_direct.is_none() && !scene_redraw && !blank_pending {
             return Ok(PresentResult::Presented {
                 redraw: release_pending,
@@ -1595,7 +1716,7 @@ impl WsiPresenter {
                     } else {
                         blur_weights(0.0, levels)
                     };
-                    if let Some((shape, progress)) = transition.running {
+                    if let Some((shape, progress)) = retained_transition {
                         self.runtime.device.cmd_bind_pipeline(
                             frame.command_buffer,
                             vk::PipelineBindPoint::GRAPHICS,
@@ -1948,24 +2069,16 @@ impl WsiPresenter {
             {
                 resources.front = target;
             }
-            self.active_transition =
-                self.transition_presentation
-                    .map(|presentation| ActiveTransition {
-                        presentation,
-                        started_at: now,
-                    });
+            self.prepared_transition = self.transition_presentation;
             log::debug!(
-                "transition started: surface=0x{:x} presentation={:?} interrupted={:?}",
+                "transition prepared: surface=0x{:x} presentation={:?} interrupted={:?}",
                 self.surface.as_raw(),
                 self.transition_presentation,
                 transition.running
             );
-        } else if transition.finished {
-            self.active_transition = None;
-            log::debug!("transition finished: surface=0x{:x}", self.surface.as_raw());
         }
         if pending_direct.is_some() {
-            self.transition_armed = false;
+            self.content_presentation.mark_submitted();
             let direct = self
                 .pending_direct_frame
                 .take()
@@ -2025,12 +2138,32 @@ impl WsiPresenter {
                 self.recreate_extent = Some(self.extent);
                 false
             }
-            Err(error) => return Err(anyhow!("vkQueuePresentKHR: {error:?}")),
+            Err(error) => {
+                self.content_presentation.discard_submitted();
+                self.prepared_transition = None;
+                return Err(anyhow!("vkQueuePresentKHR: {error:?}"));
+            }
         };
         if presented_to_compositor {
+            self.content_presentation.present_accepted();
+            if let Some(presentation) = self.prepared_transition.take() {
+                self.active_transition = Some(ActiveTransition {
+                    presentation,
+                    started_at: now,
+                });
+                log::debug!(
+                    "transition started: surface=0x{:x} presentation={presentation:?}",
+                    self.surface.as_raw()
+                );
+            } else if transition.finished {
+                self.active_transition = None;
+                log::debug!("transition finished: surface=0x{:x}", self.surface.as_raw());
+            }
             if blank_pending || pending_direct.is_some() {
                 self.blank_state.presented(blank_pending);
             }
+        } else if !scene_path {
+            self.content_presentation.discard_submitted();
         }
         self.frame_cursor = (self.frame_cursor + 1) % self.frames.len();
         let cleanup_pending =
@@ -3481,6 +3614,108 @@ mod tests {
         let mut state = BlankState::Pending;
         state.abandon();
         assert_eq!(state, BlankState::Inactive);
+    }
+
+    #[test]
+    fn content_transition_starts_only_after_an_earlier_target_commits() {
+        let mut state = ContentPresentationState::default();
+        assert!(!state.bind(10));
+        assert!(!state.should_transition(true, true));
+        state.mark_submitted();
+        state.present_accepted();
+
+        assert!(!state.bind(20));
+        assert!(state.should_transition(true, true));
+        assert!(!state.should_transition(false, true));
+        assert!(!state.should_transition(true, false));
+        state.mark_submitted();
+        state.present_accepted();
+
+        assert!(!state.bind(20));
+        assert!(!state.should_transition(true, true));
+    }
+
+    #[test]
+    fn uncommitted_target_does_not_turn_a_fast_return_into_a_transition() {
+        let mut state = ContentPresentationState::default();
+        state.bind(10);
+        state.mark_submitted();
+        state.present_accepted();
+
+        state.bind(20);
+        assert!(state.should_transition(true, true));
+        state.mark_submitted();
+        assert!(state.bind(10));
+        assert!(!state.should_transition(true, true));
+        state.mark_submitted();
+        state.present_accepted();
+
+        state.bind(20);
+        assert!(state.should_transition(true, true));
+    }
+
+    #[test]
+    fn same_content_rebind_keeps_the_committed_identity() {
+        let mut state = ContentPresentationState::default();
+        state.bind(33);
+        state.mark_submitted();
+        state.present_accepted();
+        state.unbind();
+        assert!(!state.bind(33));
+        assert!(!state.should_transition(true, true));
+    }
+
+    #[test]
+    fn rejected_present_does_not_commit_or_suppress_the_retry_transition() {
+        let mut state = ContentPresentationState::default();
+        state.bind(10);
+        state.mark_submitted();
+        state.present_accepted();
+
+        state.bind(20);
+        assert!(state.should_transition(true, true));
+        state.mark_submitted();
+        state.discard_submitted();
+
+        assert_eq!(state.committed, Some(10));
+        assert!(state.should_transition(true, true));
+    }
+
+    #[test]
+    fn newer_transition_snapshot_supersedes_or_cancels_prepared_work() {
+        let old = TransitionPresentation {
+            shape: TransitionShape::Fade,
+            duration: Duration::from_millis(300),
+        };
+        let updated = TransitionPresentation {
+            shape: TransitionShape::Wipe { angle: 90 },
+            duration: Duration::from_millis(600),
+        };
+        let mut configured = Some(old);
+        let mut prepared = Some(old);
+        let mut active = None;
+
+        assert!(!update_transition_snapshot(
+            &mut configured,
+            &mut prepared,
+            &mut active,
+            Some(updated),
+        ));
+        assert_eq!(configured, Some(updated));
+        assert_eq!(prepared, Some(updated));
+        assert_eq!(
+            retained_transition_sample(prepared, Some((TransitionShape::Fade, 0.5))),
+            Some((updated.shape, 0.0))
+        );
+
+        assert!(update_transition_snapshot(
+            &mut configured,
+            &mut prepared,
+            &mut active,
+            None,
+        ));
+        assert_eq!(configured, None);
+        assert_eq!(prepared, None);
     }
 
     #[test]
