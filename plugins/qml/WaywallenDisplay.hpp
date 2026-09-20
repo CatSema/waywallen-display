@@ -1,8 +1,8 @@
 #pragma once
 
-#include "PresentationState.hpp"
-
+#include <waywallen_display_presentation.h>
 #include <waywallen_display_protocol_types.h>
+#include <waywallen_display_vulkan_presenter.h>
 
 #include <QColor>
 #include <QElapsedTimer>
@@ -18,10 +18,6 @@
 #include <qqml.h>
 #include <cstdint>
 #include <memory>
-
-#ifdef WW_HAVE_VULKAN
-#    include "backend_vulkan_blit.h"
-#endif
 
 struct waywallen_display;
 typedef struct waywallen_display waywallen_display_t;
@@ -229,8 +225,8 @@ private slots:
     void pushSizeUpdate();
 
 private:
-    using ConfigSnapshot  = PresentationState::Config;
-    using ContentSnapshot = PresentationState::Content;
+    using ConfigSnapshot  = waywallen_composition_config_t;
+    using ContentSnapshot = waywallen_presentation_content_t;
 
     void                                    tryConnect();
     void                                    cleanup();
@@ -358,28 +354,28 @@ private:
     };
     ActiveBackend m_activeBackend { BackendNone };
 
-    PresentationState m_presentationState;
-    qulonglong        m_candidatePrepareSerial { 0 };
-    qulonglong        m_promotionSerial { 0 };
-    bool              m_promotionUsesTransition { false };
-    qulonglong        m_frameSubmissionSerial { 0 };
-    bool              m_frameSubmissionUsesTransition { false };
-    ContentSnapshot   m_outgoingContent;
-    bool              m_transitionActive { false };
-    qulonglong        m_activeTransitionSerial { 0 };
-    qreal             m_transitionProgress { 1.0 };
-    TransitionKind    m_activeTransitionKind { NoTransition };
-    int               m_activeTransitionDurationMs { 0 };
-    quint32           m_activeTransitionAngle { 0 };
-    QPointF           m_activeTransitionOrigin { 0.5, 0.5 };
-    QElapsedTimer     m_transitionClock;
-    QTimer            m_transitionTimer;
-    qulonglong        m_renderFrameSerial { 0 };
-    qulonglong        m_presentedLastFrameSerial { 0 };
-    int               m_presentedLastFrameSlot { -1 };
-    qulonglong        m_transitionLastFrameSerial { 0 };
-    int               m_transitionLastFrameSlot { -1 };
-    int               m_retirementPumpBudget { 0 };
+    waywallen_presentation_controller_t* m_presentationState { nullptr };
+    qulonglong                           m_candidatePrepareSerial { 0 };
+    qulonglong                           m_promotionSerial { 0 };
+    bool                                 m_promotionUsesTransition { false };
+    qulonglong                           m_frameSubmissionSerial { 0 };
+    bool                                 m_frameSubmissionUsesTransition { false };
+    ContentSnapshot                      m_outgoingContent;
+    bool                                 m_transitionActive { false };
+    qulonglong                           m_activeTransitionSerial { 0 };
+    qreal                                m_transitionProgress { 1.0 };
+    TransitionKind                       m_activeTransitionKind { NoTransition };
+    int                                  m_activeTransitionDurationMs { 0 };
+    quint32                              m_activeTransitionAngle { 0 };
+    QPointF                              m_activeTransitionOrigin { 0.5, 0.5 };
+    QElapsedTimer                        m_transitionClock;
+    QTimer                               m_transitionTimer;
+    qulonglong                           m_renderFrameSerial { 0 };
+    qulonglong                           m_presentedLastFrameSerial { 0 };
+    int                                  m_presentedLastFrameSlot { -1 };
+    qulonglong                           m_transitionLastFrameSerial { 0 };
+    int                                  m_transitionLastFrameSlot { -1 };
+    int                                  m_retirementPumpBudget { 0 };
 
     // EGL texture state (GL textures created lazily on render thread).
     bool          m_eglImagesValid { false };
@@ -402,7 +398,7 @@ private:
         bool     valid { false };
         int      slot { -1 };
         int      releaseSyncobjFd { -1 };
-        uint64_t bufferGeneration { 0 };
+        uint64_t buffer_generation { 0 };
         uint64_t seq { 0 };
     };
     PendingEglFrame m_pendingEgl;
@@ -433,7 +429,7 @@ private:
         int      slot { -1 };
         void*    acquireSem { nullptr }; // VkSemaphore (lib-imported sync_fd)
         int      releaseSyncobjFd { -1 };
-        uint64_t bufferGeneration { 0 };
+        uint64_t buffer_generation { 0 };
         uint64_t seq { 0 };
     };
     PendingVkFrame  m_pendingVk;

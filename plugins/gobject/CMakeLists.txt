@@ -13,6 +13,7 @@ pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4>=4.10)
 set(WW_GOBJECT_SOURCES
     ww-display.c
     ww-display.h
+    ww-display-private.h
     ww-shadow-paintable.c
     ww-shadow-paintable.h
     ww-presentation-widget.c

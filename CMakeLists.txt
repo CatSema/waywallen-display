@@ -211,6 +211,9 @@ endif()
 
 add_library(waywallen_display SHARED
     src/display.c
+    src/egl_presenter.c
+    src/presentation.c
+    src/vulkan_presenter.c
     src/codec.c
     ${_backend_sources}
     ${GENERATED_C})
@@ -249,6 +252,9 @@ endif()
 # Also build a static archive for consumers that want a fat binary.
 add_library(waywallen_display_static STATIC
     src/display.c
+    src/egl_presenter.c
+    src/presentation.c
+    src/vulkan_presenter.c
     src/codec.c
     ${_backend_sources}
     ${GENERATED_C})
@@ -318,17 +324,27 @@ if(WAYWALLEN_DISPLAY_BUILD_TESTS)
         -Wall -Wextra -Wpedantic)
     add_test(NAME test_display COMMAND test_display)
 
+    add_executable(test_presentation_state tests/test_presentation_state.c)
+    target_link_libraries(test_presentation_state PRIVATE waywallen_display_static)
+    target_compile_options(test_presentation_state PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME test_presentation_state COMMAND test_presentation_state)
+
+    add_executable(test_egl_presenter tests/test_egl_presenter.c)
+    target_link_libraries(test_egl_presenter PRIVATE waywallen_display_static)
+    target_compile_options(test_egl_presenter PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME test_egl_presenter COMMAND test_egl_presenter)
+
     if(WAYWALLEN_DISPLAY_BUILD_QML_TESTS)
         enable_language(CXX)
-        find_package(Qt6 6.2 REQUIRED COMPONENTS Gui)
-        add_executable(test_presentation_state tests/test_presentation_state.cpp)
-        target_link_libraries(test_presentation_state PRIVATE Qt6::Gui)
-        target_include_directories(test_presentation_state PRIVATE
+        add_executable(test_frame_slot_retirement tests/test_frame_slot_retirement.cpp)
+        target_include_directories(test_frame_slot_retirement PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/plugins/qml)
-        target_compile_features(test_presentation_state PRIVATE cxx_std_17)
-        target_compile_options(test_presentation_state PRIVATE
+        target_compile_features(test_frame_slot_retirement PRIVATE cxx_std_17)
+        target_compile_options(test_frame_slot_retirement PRIVATE
             -Wall -Wextra -Wpedantic)
-        add_test(NAME test_presentation_state COMMAND test_presentation_state)
+        add_test(NAME test_frame_slot_retirement COMMAND test_frame_slot_retirement)
 
         add_executable(test_reconnect_backoff tests/test_reconnect_backoff.cpp)
         target_compile_features(test_reconnect_backoff PRIVATE cxx_std_17)
@@ -475,6 +491,9 @@ install(TARGETS waywallen_display waywallen_display_static
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES
     include/waywallen_display.h
+    include/waywallen_display_egl_presenter.h
+    include/waywallen_display_presentation.h
+    include/waywallen_display_vulkan_presenter.h
     include/waywallen_display_protocol_types.h
     "${WAYWALLEN_DISPLAY_GENERATED_INCLUDE_DIR}/waywallen_display_version.h"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

@@ -1,6 +1,9 @@
 #include "ww-presentation-widget.h"
 
+#include "ww-display-private.h"
 #include "ww-shadow-paintable.h"
+
+#include <waywallen_display_presentation.h>
 
 #include <math.h>
 #include <unistd.h>
@@ -8,8 +11,6 @@
 typedef struct {
     WwShadowPaintable* paintable;
     guint64            buffer_generation;
-    guint64            content_token;
-    guint64            presentation_config_generation;
     guint64            composition_generation;
 } WwPresentationContent;
 
@@ -18,17 +19,16 @@ struct _WwPresentationWidget {
 
     WwDisplay* display;
     double     display_scale;
-    gulong     display_handlers[5];
 
     WwPresentationContent current;
     WwPresentationContent candidate;
     WwShadowPaintable*    outgoing;
-    GdkTexture*           retained_scene;
 
-    guint64  submitted_token;
-    guint64  committed_token;
-    gboolean submission_pending;
-    gboolean snapshot_submitted;
+    waywallen_presentation_controller_t* controller;
+    guint64                              submission_serial;
+    gboolean                             submission_transition;
+    gboolean                             submission_pending;
+    gboolean                             snapshot_submitted;
 
     guint64          transition_config_generation;
     WwTransitionKind transition_kind;
@@ -62,29 +62,21 @@ enum
 
 static guint signals[LAST_SIGNAL] = { 0 };
 
+static gboolean present_candidate(WwPresentationWidget* self);
+
 static void disconnect_display(WwPresentationWidget* self) {
     if (! self->display) return;
-    for (guint i = 0; i < G_N_ELEMENTS(self->display_handlers); ++i) {
-        if (self->display_handlers[i] != 0) {
-            g_signal_handler_disconnect(self->display, self->display_handlers[i]);
-            self->display_handlers[i] = 0;
-        }
-    }
+    _ww_display_clear_native_listener(self->display, self);
     g_clear_object(&self->display);
 }
 
 static void content_clear(WwPresentationContent* content) {
     g_clear_object(&content->paintable);
-    content->buffer_generation              = 0;
-    content->content_token                  = 0;
-    content->presentation_config_generation = 0;
-    content->composition_generation         = 0;
+    content->buffer_generation      = 0;
+    content->composition_generation = 0;
 }
 
-static void clear_outgoing(WwPresentationWidget* self) {
-    g_clear_object(&self->outgoing);
-    g_clear_object(&self->retained_scene);
-}
+static void clear_outgoing(WwPresentationWidget* self) { g_clear_object(&self->outgoing); }
 
 static double clamp_progress(double progress) { return CLAMP(progress, 0.0, 1.0); }
 
@@ -126,12 +118,6 @@ static void snapshot_paintable(GtkSnapshot* snapshot, WwShadowPaintable* paintab
 
 static void snapshot_outgoing(WwPresentationWidget* self, GtkSnapshot* snapshot, float width,
                               float height) {
-    if (self->retained_scene) {
-        graphene_rect_t bounds;
-        graphene_rect_init(&bounds, 0.0f, 0.0f, width, height);
-        gtk_snapshot_append_texture(snapshot, self->retained_scene, &bounds);
-        return;
-    }
     snapshot_paintable(snapshot, self->outgoing, width, height);
 }
 
@@ -232,28 +218,6 @@ static void snapshot_scene(WwPresentationWidget* self, GtkSnapshot* snapshot, fl
     gtk_snapshot_pop(snapshot);
 }
 
-static GdkTexture* capture_scene(WwPresentationWidget* self) {
-    const int width  = gtk_widget_get_width(GTK_WIDGET(self));
-    const int height = gtk_widget_get_height(GTK_WIDGET(self));
-    if (width <= 0 || height <= 0) return NULL;
-
-    GtkSnapshot* snapshot = gtk_snapshot_new();
-    snapshot_scene(self, snapshot, (float)width, (float)height);
-    GskRenderNode* node = gtk_snapshot_free_to_node(snapshot);
-    if (! node) return NULL;
-    GtkNative*   native   = gtk_widget_get_native(GTK_WIDGET(self));
-    GskRenderer* renderer = native ? gtk_native_get_renderer(native) : NULL;
-    if (! renderer) {
-        gsk_render_node_unref(node);
-        return NULL;
-    }
-    graphene_rect_t viewport;
-    graphene_rect_init(&viewport, 0.0f, 0.0f, (float)width, (float)height);
-    GdkTexture* texture = gsk_renderer_render_texture(renderer, node, &viewport);
-    gsk_render_node_unref(node);
-    return texture;
-}
-
 static void cancel_transition(WwPresentationWidget* self) {
     self->transition_pending  = FALSE;
     self->transition_active   = FALSE;
@@ -264,6 +228,7 @@ static void cancel_transition(WwPresentationWidget* self) {
         self->tick_id = 0;
     }
     clear_outgoing(self);
+    waywallen_presentation_controller_set_transition_active(self->controller, false);
 }
 
 static gboolean transition_tick(GtkWidget* widget, GdkFrameClock* frame_clock, gpointer user_data) {
@@ -277,16 +242,33 @@ static gboolean transition_tick(GtkWidget* widget, GdkFrameClock* frame_clock, g
 
     self->tick_id = 0;
     cancel_transition(self);
+    present_candidate(self);
     return G_SOURCE_REMOVE;
 }
 
 static void after_paint(GdkFrameClock* frame_clock, WwPresentationWidget* self) {
     if (! self->submission_pending || ! self->snapshot_submitted) return;
     self->snapshot_submitted = FALSE;
-    self->submission_pending = FALSE;
-    self->committed_token    = self->submitted_token;
+    const gboolean should_start_transition =
+        self->submission_transition && self->transition_pending;
+    waywallen_presentation_content_t             accepted = { 0 };
+    const waywallen_presentation_accept_result_t result = waywallen_presentation_controller_accept(
+        self->controller, self->submission_serial, &accepted);
+    self->submission_pending    = FALSE;
+    self->submission_serial     = 0;
+    self->submission_transition = FALSE;
+    if (result == WAYWALLEN_PRESENTATION_ACCEPT_REJECTED) {
+        cancel_transition(self);
+        return;
+    }
 
-    if (! self->transition_pending) return;
+    if (! should_start_transition) {
+        self->transition_pending = FALSE;
+        clear_outgoing(self);
+        waywallen_presentation_controller_set_transition_active(self->controller, false);
+        present_candidate(self);
+        return;
+    }
     self->transition_pending  = FALSE;
     self->transition_active   = TRUE;
     self->transition_start_us = gdk_frame_clock_get_frame_time(frame_clock);
@@ -324,6 +306,7 @@ static void presentation_realize(GtkWidget* widget) {
         self->after_paint_id =
             g_signal_connect(self->frame_clock, "after-paint", G_CALLBACK(after_paint), self);
     }
+    if (! self->submission_pending) present_candidate(self);
 }
 
 static void presentation_unrealize(GtkWidget* widget) {
@@ -334,7 +317,6 @@ static void presentation_unrealize(GtkWidget* widget) {
     }
     self->frame_clock = NULL;
     cancel_transition(self);
-    self->submission_pending = FALSE;
     self->snapshot_submitted = FALSE;
     GTK_WIDGET_CLASS(ww_presentation_widget_parent_class)->unrealize(widget);
 }
@@ -343,6 +325,8 @@ static void ww_presentation_widget_dispose(GObject* object) {
     WwPresentationWidget* self = WW_PRESENTATION_WIDGET(object);
     disconnect_display(self);
     ww_presentation_widget_clear(self);
+    waywallen_presentation_controller_free(self->controller);
+    self->controller = NULL;
     G_OBJECT_CLASS(ww_presentation_widget_parent_class)->dispose(object);
 }
 
@@ -373,6 +357,8 @@ static void ww_presentation_widget_class_init(WwPresentationWidgetClass* klass) 
 }
 
 static void ww_presentation_widget_init(WwPresentationWidget* self) {
+    self->controller = waywallen_presentation_controller_new();
+    if (! self->controller) g_error("failed to allocate presentation controller");
     self->display_scale          = 1.0;
     self->transition_kind        = WW_TRANSITION_KIND_NONE;
     self->transition_duration_ms = 400;
@@ -386,20 +372,16 @@ WwPresentationWidget* ww_presentation_widget_new(void) {
     return g_object_new(WW_TYPE_PRESENTATION_WIDGET, NULL);
 }
 
-static void on_display_binding_ready(WwDisplay* display, guint64 buffer_generation,
-                                     guint64 content_token, guint64 presentation_config_generation,
-                                     guint64 composition_generation, guint count, guint width,
-                                     guint height, guint fourcc, guint64 modifier, gint backend,
-                                     gdouble sx, gdouble sy, gdouble sw, gdouble sh, gdouble dx,
-                                     gdouble dy, gdouble dw, gdouble dh, guint transform,
-                                     gdouble cr, gdouble cg, gdouble cb, gdouble ca,
-                                     WwPresentationWidget* self) {
-    (void)modifier;
-    gint    fd              = -1;
-    guint   n_planes        = 0;
-    guint   strides[4]      = { 0 };
-    guint64 offsets[4]      = { 0 };
-    guint64 shadow_modifier = 0;
+static void on_display_binding_ready(WwDisplay* display, const waywallen_binding_t* binding,
+                                     void* user_data) {
+    WwPresentationWidget*                 self            = WW_PRESENTATION_WIDGET(user_data);
+    const waywallen_textures_t*           textures        = &binding->textures;
+    const waywallen_composition_config_t* config          = &binding->config;
+    gint                                  fd              = -1;
+    guint                                 n_planes        = 0;
+    guint                                 strides[4]      = { 0 };
+    guint64                               offsets[4]      = { 0 };
+    guint64                               shadow_modifier = 0;
     if (! ww_display_get_shadow_export(
             display, &fd, &n_planes, strides, offsets, &shadow_modifier)) {
         g_warning("ww_presentation_widget: shadow export is unavailable");
@@ -409,93 +391,100 @@ static void on_display_binding_ready(WwDisplay* display, guint64 buffer_generati
     if (! ww_presentation_widget_stage_shadow(self,
                                               fd,
                                               n_planes,
-                                              width,
-                                              height,
-                                              fourcc,
+                                              textures->tex_width,
+                                              textures->tex_height,
+                                              textures->fourcc,
                                               shadow_modifier,
                                               strides,
                                               offsets,
-                                              buffer_generation,
-                                              content_token,
-                                              presentation_config_generation,
-                                              composition_generation,
-                                              sx,
-                                              sy,
-                                              sw,
-                                              sh,
-                                              dx / scale,
-                                              dy / scale,
-                                              dw / scale,
-                                              dh / scale,
-                                              transform,
-                                              cr,
-                                              cg,
-                                              cb,
-                                              ca)) {
+                                              textures->buffer_generation,
+                                              binding->content_token,
+                                              binding->presentation_config_generation,
+                                              config->generation,
+                                              config->source_rect.x,
+                                              config->source_rect.y,
+                                              config->source_rect.w,
+                                              config->source_rect.h,
+                                              config->dest_rect.x / scale,
+                                              config->dest_rect.y / scale,
+                                              config->dest_rect.w / scale,
+                                              config->dest_rect.h / scale,
+                                              config->transform,
+                                              config->clear_color.r,
+                                              config->clear_color.g,
+                                              config->clear_color.b,
+                                              config->clear_color.a)) {
         g_warning("ww_presentation_widget: failed to stage shadow");
         return;
     }
-    g_signal_emit(self, signals[SIGNAL_BINDING_STAGED], 0, count, width, height, fourcc, backend);
+    g_signal_emit(self,
+                  signals[SIGNAL_BINDING_STAGED],
+                  0,
+                  textures->count,
+                  textures->tex_width,
+                  textures->tex_height,
+                  textures->fourcc,
+                  textures->backend);
 }
 
-static void on_display_textures_releasing(WwDisplay* display, guint64 buffer_generation,
-                                          WwPresentationWidget* self) {
+static void on_display_textures_releasing(WwDisplay* display, const waywallen_textures_t* textures,
+                                          void* user_data) {
     (void)display;
-    ww_presentation_widget_retire_binding(self, buffer_generation);
+    ww_presentation_widget_retire_binding(WW_PRESENTATION_WIDGET(user_data),
+                                          textures->buffer_generation);
 }
 
-static void on_display_composition(WwDisplay* display, guint64 composition_generation,
-                                   guint64 buffer_generation, gdouble sx, gdouble sy, gdouble sw,
-                                   gdouble sh, gdouble dx, gdouble dy, gdouble dw, gdouble dh,
-                                   guint transform, gdouble cr, gdouble cg, gdouble cb, gdouble ca,
-                                   WwPresentationWidget* self) {
+static void on_display_composition(WwDisplay* display, const waywallen_composition_config_t* config,
+                                   void* user_data) {
     (void)display;
-    const double scale = self->display_scale;
+    WwPresentationWidget* self  = WW_PRESENTATION_WIDGET(user_data);
+    const double          scale = self->display_scale;
     ww_presentation_widget_set_composition(self,
-                                           composition_generation,
-                                           buffer_generation,
-                                           sx,
-                                           sy,
-                                           sw,
-                                           sh,
-                                           dx / scale,
-                                           dy / scale,
-                                           dw / scale,
-                                           dh / scale,
-                                           transform,
-                                           cr,
-                                           cg,
-                                           cb,
-                                           ca);
+                                           config->generation,
+                                           config->buffer_generation,
+                                           config->source_rect.x,
+                                           config->source_rect.y,
+                                           config->source_rect.w,
+                                           config->source_rect.h,
+                                           config->dest_rect.x / scale,
+                                           config->dest_rect.y / scale,
+                                           config->dest_rect.w / scale,
+                                           config->dest_rect.h / scale,
+                                           config->transform,
+                                           config->clear_color.r,
+                                           config->clear_color.g,
+                                           config->clear_color.b,
+                                           config->clear_color.a);
 }
 
-static void on_display_frame(WwDisplay* display, guint64 buffer_generation, guint buffer_index,
-                             guint64 seq, gint release_fd, WwPresentationWidget* self) {
+static void on_display_frame(WwDisplay* display, const waywallen_frame_t* frame, void* user_data) {
     (void)display;
-    (void)buffer_index;
-    (void)seq;
-    ww_presentation_widget_frame_ready(self, buffer_generation);
-    ww_display_close_fd(release_fd);
+    WwPresentationWidget* self = WW_PRESENTATION_WIDGET(user_data);
+    ww_presentation_widget_frame_ready(self, frame->buffer_generation);
+    ww_display_close_fd(frame->release_syncobj_fd);
 }
 
-static void on_display_presentation(WwDisplay* display, guint64 config_generation,
-                                    guint64 state_generation, guint pause_kind, guint blur_radius,
-                                    gboolean pause_active, guint transition_kind, guint duration_ms,
-                                    guint angle, gdouble origin_x, gdouble origin_y,
-                                    WwPresentationWidget* self) {
+static void on_display_presentation(WwDisplay*                               display,
+                                    const waywallen_presentation_snapshot_t* presentation,
+                                    void*                                    user_data) {
     (void)display;
-    (void)state_generation;
-    (void)pause_kind;
-    (void)blur_radius;
-    (void)pause_active;
+    WwPresentationWidget* self = WW_PRESENTATION_WIDGET(user_data);
     ww_presentation_widget_set_transition(self,
-                                          config_generation,
-                                          (WwTransitionKind)transition_kind,
-                                          duration_ms,
-                                          angle,
-                                          origin_x,
-                                          origin_y);
+                                          presentation->config.generation,
+                                          (WwTransitionKind)presentation->config.transition.kind,
+                                          presentation->config.transition.duration_ms,
+                                          presentation->config.transition.angle,
+                                          presentation->config.transition.origin_x,
+                                          presentation->config.transition.origin_y);
 }
+
+static const WwDisplayNativeListener kDisplayListener = {
+    .binding_ready         = on_display_binding_ready,
+    .textures_releasing    = on_display_textures_releasing,
+    .composition_config    = on_display_composition,
+    .frame_ready           = on_display_frame,
+    .presentation_snapshot = on_display_presentation,
+};
 
 void ww_presentation_widget_set_display(WwPresentationWidget* self, WwDisplay* display,
                                         gdouble scale) {
@@ -507,16 +496,7 @@ void ww_presentation_widget_set_display(WwPresentationWidget* self, WwDisplay* d
     if (! display) return;
 
     self->display = g_object_ref(display);
-    self->display_handlers[0] =
-        g_signal_connect(display, "binding-ready", G_CALLBACK(on_display_binding_ready), self);
-    self->display_handlers[1] = g_signal_connect(
-        display, "textures-releasing", G_CALLBACK(on_display_textures_releasing), self);
-    self->display_handlers[2] =
-        g_signal_connect(display, "composition-config", G_CALLBACK(on_display_composition), self);
-    self->display_handlers[3] =
-        g_signal_connect(display, "frame-ready", G_CALLBACK(on_display_frame), self);
-    self->display_handlers[4] = g_signal_connect(
-        display, "presentation-snapshot", G_CALLBACK(on_display_presentation), self);
+    _ww_display_set_native_listener(display, &kDisplayListener, self);
 }
 
 gboolean ww_presentation_widget_stage_shadow(
@@ -542,11 +522,32 @@ gboolean ww_presentation_widget_stage_shadow(
         paintable, sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca);
 
     content_clear(&self->candidate);
-    self->candidate.paintable                      = paintable;
-    self->candidate.buffer_generation              = buffer_generation;
-    self->candidate.content_token                  = content_token;
-    self->candidate.presentation_config_generation = presentation_config_generation;
-    self->candidate.composition_generation         = composition_generation;
+    self->candidate.paintable              = paintable;
+    self->candidate.buffer_generation      = buffer_generation;
+    self->candidate.composition_generation = composition_generation;
+
+    waywallen_presentation_controller_begin_incoming(self->controller,
+                                                     buffer_generation,
+                                                     content_token,
+                                                     presentation_config_generation,
+                                                     width,
+                                                     height,
+                                                     fourcc,
+                                                     true);
+    const waywallen_composition_config_t config = {
+        .generation        = composition_generation,
+        .buffer_generation = buffer_generation,
+        .source_rect       = { (float)sx, (float)sy, (float)sw, (float)sh },
+        .dest_rect         = { (float)dx, (float)dy, (float)dw, (float)dh },
+        .transform         = transform,
+        .clear_color       = { (float)cr, (float)cg, (float)cb, (float)ca },
+    };
+    if (waywallen_presentation_controller_apply_config(self->controller, &config) ==
+        WAYWALLEN_PRESENTATION_CONFIG_REJECTED) {
+        content_clear(&self->candidate);
+        waywallen_presentation_controller_retire_incoming(self->controller, buffer_generation);
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -564,6 +565,18 @@ void ww_presentation_widget_set_composition(WwPresentationWidget* self,
         content = &self->current;
     if (! content || composition_generation <= content->composition_generation) return;
 
+    const waywallen_composition_config_t config = {
+        .generation        = composition_generation,
+        .buffer_generation = buffer_generation,
+        .source_rect       = { (float)sx, (float)sy, (float)sw, (float)sh },
+        .dest_rect         = { (float)dx, (float)dy, (float)dw, (float)dh },
+        .transform         = transform,
+        .clear_color       = { (float)cr, (float)cg, (float)cb, (float)ca },
+    };
+    if (waywallen_presentation_controller_apply_config(self->controller, &config) ==
+        WAYWALLEN_PRESENTATION_CONFIG_REJECTED) {
+        return;
+    }
     content->composition_generation = composition_generation;
     ww_shadow_paintable_set_composition(
         content->paintable, sx, sy, sw, sh, dx, dy, dw, dh, transform, cr, cg, cb, ca);
@@ -573,39 +586,47 @@ void ww_presentation_widget_set_composition(WwPresentationWidget* self,
 void ww_presentation_widget_retire_binding(WwPresentationWidget* self, guint64 buffer_generation) {
     g_return_if_fail(WW_IS_PRESENTATION_WIDGET(self));
     if (self->candidate.buffer_generation == buffer_generation) content_clear(&self->candidate);
+    waywallen_presentation_controller_retire_incoming(self->controller, buffer_generation);
 }
 
-void ww_presentation_widget_frame_ready(WwPresentationWidget* self, guint64 buffer_generation) {
-    g_return_if_fail(WW_IS_PRESENTATION_WIDGET(self));
-    if (self->candidate.buffer_generation != buffer_generation) {
-        if (self->current.buffer_generation == buffer_generation && self->current.paintable) {
-            ww_shadow_paintable_refresh(self->current.paintable);
-            gtk_widget_queue_draw(GTK_WIDGET(self));
-        }
-        return;
-    }
+static gboolean present_candidate(WwPresentationWidget* self) {
+    if (! self->candidate.paintable || self->submission_pending) return FALSE;
 
-    ww_shadow_paintable_refresh(self->candidate.paintable);
-    const gboolean same_current = self->current.content_token != 0 &&
-                                  self->current.content_token == self->candidate.content_token;
-    const gboolean same_committed =
-        self->committed_token != 0 && self->committed_token == self->candidate.content_token;
+    waywallen_presentation_content_t incoming = { 0 };
+    if (! waywallen_presentation_controller_incoming_for(
+            self->controller, self->candidate.buffer_generation, &incoming)) {
+        return FALSE;
+    }
     const gboolean configured =
         self->transition_kind != WW_TRANSITION_KIND_NONE && self->transition_config_generation != 0;
-    const gboolean should_transition = self->committed_token != 0 && ! same_committed &&
-                                       ! same_current && configured && self->current.paintable;
+    guint64                                       serial = 0;
+    const waywallen_presentation_prepare_result_t result =
+        waywallen_presentation_controller_prepare(
+            self->controller, &incoming, configured, self->current.paintable != NULL, &serial);
+    if (result == WAYWALLEN_PRESENTATION_PREPARE_REJECTED ||
+        result == WAYWALLEN_PRESENTATION_PREPARE_QUEUED) {
+        return FALSE;
+    }
+
+    gboolean should_transition = result == WAYWALLEN_PRESENTATION_PREPARE_TRANSITION;
+    if (result == WAYWALLEN_PRESENTATION_PREPARE_ALREADY_PREPARED) {
+        waywallen_presentation_content_t prepared   = { 0 };
+        bool                             transition = false;
+        if (! waywallen_presentation_controller_prepared(
+                self->controller, serial, &prepared, &transition)) {
+            return FALSE;
+        }
+        should_transition = transition;
+    }
+
+    if (! waywallen_presentation_controller_promote(self->controller, serial)) {
+        waywallen_presentation_controller_discard(self->controller, serial);
+        return FALSE;
+    }
 
     if (should_transition) {
-        GdkTexture* retained = NULL;
-        if (self->transition_pending || self->transition_active) retained = capture_scene(self);
         clear_outgoing(self);
-        if (retained)
-            self->retained_scene = retained;
-        else {
-            if (self->transition_pending || self->transition_active)
-                g_warning("ww_presentation_widget: failed to retain interrupted scene");
-            self->outgoing = g_object_ref(self->current.paintable);
-        }
+        self->outgoing = g_object_ref(self->current.paintable);
 
         self->active_kind         = self->transition_kind;
         self->active_duration_ms  = self->transition_duration_ms;
@@ -619,17 +640,37 @@ void ww_presentation_widget_frame_ready(WwPresentationWidget* self, guint64 buff
             gtk_widget_remove_tick_callback(GTK_WIDGET(self), self->tick_id);
             self->tick_id = 0;
         }
-    } else if (! same_current) {
-        cancel_transition(self);
+        waywallen_presentation_controller_set_transition_active(self->controller, true);
+    } else {
+        clear_outgoing(self);
+        self->transition_pending  = FALSE;
+        self->transition_active   = FALSE;
+        self->transition_progress = 1.0;
     }
 
     content_clear(&self->current);
-    self->current            = self->candidate;
-    self->candidate          = (WwPresentationContent) { 0 };
-    self->submitted_token    = self->current.content_token;
-    self->submission_pending = TRUE;
-    self->snapshot_submitted = FALSE;
+    self->current               = self->candidate;
+    self->candidate             = (WwPresentationContent) { 0 };
+    self->submission_serial     = serial;
+    self->submission_transition = should_transition;
+    self->submission_pending    = TRUE;
+    self->snapshot_submitted    = FALSE;
     gtk_widget_queue_draw(GTK_WIDGET(self));
+    return TRUE;
+}
+
+void ww_presentation_widget_frame_ready(WwPresentationWidget* self, guint64 buffer_generation) {
+    g_return_if_fail(WW_IS_PRESENTATION_WIDGET(self));
+    if (self->candidate.buffer_generation != buffer_generation) {
+        if (self->current.buffer_generation == buffer_generation && self->current.paintable) {
+            ww_shadow_paintable_refresh(self->current.paintable);
+            gtk_widget_queue_draw(GTK_WIDGET(self));
+        }
+        return;
+    }
+
+    ww_shadow_paintable_refresh(self->candidate.paintable);
+    present_candidate(self);
 }
 
 void ww_presentation_widget_set_transition(WwPresentationWidget* self, guint64 config_generation,
@@ -651,6 +692,7 @@ void ww_presentation_widget_set_transition(WwPresentationWidget* self, guint64 c
     }
     if (kind == WW_TRANSITION_KIND_NONE) {
         cancel_transition(self);
+        if (! self->submission_pending) present_candidate(self);
         gtk_widget_queue_draw(GTK_WIDGET(self));
     }
 }
@@ -660,9 +702,10 @@ void ww_presentation_widget_clear(WwPresentationWidget* self) {
     cancel_transition(self);
     content_clear(&self->candidate);
     content_clear(&self->current);
-    self->submitted_token    = 0;
-    self->committed_token    = 0;
-    self->submission_pending = FALSE;
-    self->snapshot_submitted = FALSE;
+    waywallen_presentation_controller_reset(self->controller);
+    self->submission_serial     = 0;
+    self->submission_transition = FALSE;
+    self->submission_pending    = FALSE;
+    self->snapshot_submitted    = FALSE;
     gtk_widget_queue_draw(GTK_WIDGET(self));
 }

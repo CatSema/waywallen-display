@@ -41,6 +41,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "waywallen_display_protocol_types.h"
+#include "waywallen_display_presentation.h"
+#include "waywallen_display_egl_presenter.h"
+#include "waywallen_display_vulkan_presenter.h"
 #include "waywallen_display_version.h"
 
 #ifdef __cplusplus

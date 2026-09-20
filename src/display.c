@@ -250,7 +250,10 @@ struct waywallen_display {
      * that imports producer DMA-BUFs into sampled VkImages and blits
      * them into a LINEAR-tiled shadow whose DMA-BUF is re-exported. */
     ww_vk_owned_t   vk_owned;
-    ww_vk_blitter_t vk_blitter;
+    ww_vk_blitter_t vk_relay_blitter;
+
+    /* Compatibility state for the legacy sampled-frame helpers. */
+    waywallen_vulkan_presenter_t* vk_presenter;
 #endif
 
     /* Guards `vk_pending` / `egl_pending` against concurrent push from
@@ -1215,15 +1218,14 @@ int waywallen_display_vulkan_consume_frame(waywallen_display_t* d, const waywall
         }
         return WAYWALLEN_ERR_STATE;
     }
-    if (! ww_vk_blitter_initialized(&d->vk_blitter)) {
-        int init_rc =
-            ww_vk_blitter_init(&d->vk_blitter,
-                               (VkInstance)d->vk.instance,
-                               (VkPhysicalDevice)d->vk.physical_device,
-                               (VkDevice)d->vk.device,
-                               d->vk.queue_family_index,
-                               d->vk_host_queue,
-                               (ww_vk_get_instance_proc_addr_fn)d->vk.vk_get_instance_proc_addr);
+    if (! d->vk_presenter) {
+        int init_rc = waywallen_vulkan_presenter_create(d->vk.instance,
+                                                        d->vk.physical_device,
+                                                        d->vk.device,
+                                                        d->vk.queue_family_index,
+                                                        d->vk_host_queue,
+                                                        d->vk.vk_get_instance_proc_addr,
+                                                        &d->vk_presenter);
         if (init_rc != 0) {
             if (frame->release_syncobj_fd >= 0) {
                 (void)resolve_frame_without_gpu(d,
@@ -1239,33 +1241,38 @@ int waywallen_display_vulkan_consume_frame(waywallen_display_t* d, const waywall
     const waywallen_textures_t* textures        = &d->bound.binding.textures;
     bool                        candidate_ready = false;
     bool                        release_armed   = false;
-    int                         rc = ww_vk_blitter_prepare(&d->vk_blitter,
-                                                           d->vk_images[frame->buffer_index].image,
-                                                           textures->tex_width,
-                                                           textures->tex_height,
-                                                           textures->fourcc,
-                                                           false,
-                                                           (VkSemaphore)frame->vk_acquire_semaphore,
-                                                           frame->release_syncobj_fd,
-                                                           &candidate_ready,
-                                                           &release_armed);
+    int rc = waywallen_vulkan_presenter_prepare(d->vk_presenter,
+                                                d->vk_images[frame->buffer_index].image,
+                                                textures->tex_width,
+                                                textures->tex_height,
+                                                textures->fourcc,
+                                                false,
+                                                false,
+                                                frame->vk_acquire_semaphore,
+                                                frame->release_syncobj_fd,
+                                                &candidate_ready,
+                                                &release_armed);
     if (release_armed &&
         acknowledge_frame_release(d, frame->buffer_generation, frame->seq) != WAYWALLEN_OK) {
-        if (candidate_ready) (void)ww_vk_blitter_discard_candidate(&d->vk_blitter);
+        if (candidate_ready) (void)waywallen_vulkan_presenter_discard_candidate(d->vk_presenter);
         return WAYWALLEN_ERR_IO;
     }
     if (rc != 0) {
-        if (candidate_ready) (void)ww_vk_blitter_discard_candidate(&d->vk_blitter);
+        if (candidate_ready) (void)waywallen_vulkan_presenter_discard_candidate(d->vk_presenter);
         return WAYWALLEN_ERR_IO;
     }
-    out->image     = (void*)(candidate_ready ? ww_vk_blitter_candidate(&d->vk_blitter)
-                                             : ww_vk_blitter_shadow(&d->vk_blitter));
-    out->format    = (uint32_t)ww_fourcc_to_vk_format(textures->fourcc);
-    out->width     = textures->tex_width;
-    out->height    = textures->tex_height;
-    out->layout    = (uint32_t)ww_vk_blitter_shadow_layout(&d->vk_blitter);
+    waywallen_vulkan_presentable_descriptor_t descriptor = { 0 };
+    bool described = candidate_ready
+                         ? waywallen_vulkan_presenter_candidate(d->vk_presenter, &descriptor)
+                         : waywallen_vulkan_presenter_current(d->vk_presenter, &descriptor);
+    if (! described) return WAYWALLEN_ERR_IO;
+    out->image     = descriptor.image;
+    out->format    = descriptor.format;
+    out->width     = descriptor.width;
+    out->height    = descriptor.height;
+    out->layout    = descriptor.layout;
     out->candidate = candidate_ready;
-    return out->image != NULL ? WAYWALLEN_OK : WAYWALLEN_ERR_IO;
+    return WAYWALLEN_OK;
 #else
     (void)d;
     (void)frame;
@@ -1275,12 +1282,15 @@ int waywallen_display_vulkan_consume_frame(waywallen_display_t* d, const waywall
 
 int waywallen_display_vulkan_commit_sampled_frame(waywallen_display_t* d) {
 #ifdef WW_HAVE_VULKAN
-    if (! d || d->backend != WAYWALLEN_BACKEND_VULKAN ||
-        ! ww_vk_blitter_initialized(&d->vk_blitter)) {
+    if (! d || d->backend != WAYWALLEN_BACKEND_VULKAN || ! d->vk_presenter) {
         return WAYWALLEN_ERR_STATE;
     }
-    return ww_vk_blitter_commit_candidate(&d->vk_blitter) == VK_SUCCESS ? WAYWALLEN_OK
-                                                                        : WAYWALLEN_ERR_IO;
+    waywallen_vulkan_presentable_t* retained = NULL;
+    if (waywallen_vulkan_presenter_commit(d->vk_presenter, &retained) != 0) {
+        return WAYWALLEN_ERR_IO;
+    }
+    waywallen_vulkan_presenter_release(d->vk_presenter, retained);
+    return WAYWALLEN_OK;
 #else
     (void)d;
     return WAYWALLEN_ERR_NOT_IMPL;
@@ -1289,11 +1299,11 @@ int waywallen_display_vulkan_commit_sampled_frame(waywallen_display_t* d) {
 
 int waywallen_display_vulkan_discard_sampled_frame(waywallen_display_t* d) {
 #ifdef WW_HAVE_VULKAN
-    if (! d || d->backend != WAYWALLEN_BACKEND_VULKAN ||
-        ! ww_vk_blitter_initialized(&d->vk_blitter)) {
+    if (! d || d->backend != WAYWALLEN_BACKEND_VULKAN || ! d->vk_presenter) {
         return WAYWALLEN_ERR_STATE;
     }
-    return ww_vk_blitter_discard_candidate(&d->vk_blitter) == 0 ? WAYWALLEN_OK : WAYWALLEN_ERR_IO;
+    return waywallen_vulkan_presenter_discard_candidate(d->vk_presenter) == 0 ? WAYWALLEN_OK
+                                                                              : WAYWALLEN_ERR_IO;
 #else
     (void)d;
     return WAYWALLEN_ERR_NOT_IMPL;
@@ -1325,7 +1335,7 @@ int waywallen_display_bind_dmabuf_relay(waywallen_display_t* d) {
         return WAYWALLEN_ERR_NOT_IMPL;
     }
 
-    rc = ww_vk_blitter_init(&d->vk_blitter,
+    rc = ww_vk_blitter_init(&d->vk_relay_blitter,
                             d->vk_owned.instance,
                             d->vk_owned.physical_device,
                             d->vk_owned.device,
@@ -2466,14 +2476,15 @@ static int handle_bind_buffers(waywallen_display_t* d, const uint8_t* body, size
         if (import_rc == 0) {
             VkFormat shadow_fmt = ww_fourcc_to_vk_format(bb.fourcc);
             import_rc           = ww_vk_blitter_ensure_shadow_exportable(
-                &d->vk_blitter, bb.width, bb.height, shadow_fmt);
+                &d->vk_relay_blitter, bb.width, bb.height, shadow_fmt);
             if (import_rc == 0) {
                 int      sfd                               = -1;
                 uint32_t sn                                = 0;
                 uint32_t sstr[WAYWALLEN_DMABUF_MAX_PLANES] = { 0 };
                 uint64_t soff[WAYWALLEN_DMABUF_MAX_PLANES] = { 0 };
                 uint64_t smod                              = 0;
-                if (ww_vk_blitter_get_export(&d->vk_blitter, &sfd, &sn, sstr, soff, &smod) == 0) {
+                if (ww_vk_blitter_get_export(&d->vk_relay_blitter, &sfd, &sn, sstr, soff, &smod) ==
+                    0) {
                     textures.shadow_dmabuf_fd = sfd;
                     textures.shadow_n_planes  = sn;
                     for (uint32_t i = 0; i < sn && i < WAYWALLEN_DMABUF_MAX_PLANES; i++) {
@@ -2749,7 +2760,7 @@ static int handle_frame_ready(waywallen_display_t* d, const uint8_t* body, size_
         fd_handled = 1;
     }
     if (! fd_handled && d->backend == WAYWALLEN_BACKEND_DMABUF_RELAY && d->vk_backend.loaded &&
-        d->vk_semaphores && ww_vk_blitter_initialized(&d->vk_blitter)) {
+        d->vk_semaphores && ww_vk_blitter_initialized(&d->vk_relay_blitter)) {
         uint32_t    slot    = fr.buffer_index;
         VkSemaphore acq_sem = VK_NULL_HANDLE;
         if (slot < d->vk_import_count && d->vk_semaphores[slot] != VK_NULL_HANDLE) {
@@ -2766,7 +2777,7 @@ static int handle_frame_ready(waywallen_display_t* d, const uint8_t* body, size_
             /* Blit consumes release_syncobj_fd (signals + close) on its
              * own success/failure paths — pass ownership through. */
             bool armed    = false;
-            int  blit_rc  = ww_vk_blitter_blit(&d->vk_blitter,
+            int  blit_rc  = ww_vk_blitter_blit(&d->vk_relay_blitter,
                                                d->vk_images[slot].image,
                                                d->bound.binding.textures.tex_width,
                                                d->bound.binding.textures.tex_height,
@@ -2775,7 +2786,7 @@ static int handle_frame_ready(waywallen_display_t* d, const uint8_t* body, size_
                                                &armed);
             release_armed = armed ? 1 : 0;
             if (blit_rc != 0 && ! armed) {
-                ww_vk_blitter_shutdown(&d->vk_blitter);
+                ww_vk_blitter_shutdown(&d->vk_relay_blitter);
                 ww_evt_frame_ready_free(&fr);
                 fire_disconnected(d, WAYWALLEN_ERR_IO, "relay frame release could not be armed");
                 return WAYWALLEN_ERR_IO;
@@ -3128,12 +3139,13 @@ void waywallen_display_close(waywallen_display_t* d) {
     }
     fire_textures_releasing_if_any(d);
 #ifdef WW_HAVE_VULKAN
-    if (d->backend == WAYWALLEN_BACKEND_VULKAN && ww_vk_blitter_initialized(&d->vk_blitter)) {
-        ww_vk_blitter_shutdown(&d->vk_blitter);
+    if (d->vk_presenter) {
+        waywallen_vulkan_presenter_destroy(d->vk_presenter);
+        d->vk_presenter = NULL;
     }
     /* DMABUF_RELAY owns the complete Vulkan stack. */
     if (d->backend == WAYWALLEN_BACKEND_DMABUF_RELAY) {
-        ww_vk_blitter_shutdown(&d->vk_blitter);
+        ww_vk_blitter_shutdown(&d->vk_relay_blitter);
         ww_vk_backend_unload(&d->vk_backend);
         ww_vk_destroy_owned(&d->vk_owned);
     }

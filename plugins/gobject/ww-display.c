@@ -1,4 +1,4 @@
-#include "ww-display.h"
+#include "ww-display-private.h"
 
 #include <waywallen_display.h>
 
@@ -12,23 +12,25 @@ struct _WwDisplay {
      * shadow descriptor. Filled in the trampoline; consumers read via
      * ww_display_get_shadow_export. fd is lib-owned — wrapper dups on
      * the way out. */
-    gint              shadow_fd;
-    guint             shadow_n_planes;
-    guint             shadow_strides[4];
-    guint64           shadow_offsets[4];
-    guint64           shadow_modifier;
-    guint64           shadow_buffer_generation;
-    gboolean          shadow_valid;
-    WwPauseEffectKind pause_effect_kind;
-    guint             blur_radius;
-    gboolean          pause_effect_active;
-    guint64           presentation_config_generation;
-    guint64           presentation_state_generation;
-    WwTransitionKind  transition_kind;
-    guint             transition_duration_ms;
-    guint             transition_angle;
-    gdouble           transition_origin_x;
-    gdouble           transition_origin_y;
+    gint                    shadow_fd;
+    guint                   shadow_n_planes;
+    guint                   shadow_strides[4];
+    guint64                 shadow_offsets[4];
+    guint64                 shadow_modifier;
+    guint64                 shadow_buffer_generation;
+    gboolean                shadow_valid;
+    WwPauseEffectKind       pause_effect_kind;
+    guint                   blur_radius;
+    gboolean                pause_effect_active;
+    guint64                 presentation_config_generation;
+    guint64                 presentation_state_generation;
+    WwTransitionKind        transition_kind;
+    guint                   transition_duration_ms;
+    guint                   transition_angle;
+    gdouble                 transition_origin_x;
+    gdouble                 transition_origin_y;
+    WwDisplayNativeListener native_listener;
+    void*                   native_listener_data;
 };
 
 G_DEFINE_FINAL_TYPE(WwDisplay, ww_display, G_TYPE_OBJECT)
@@ -89,6 +91,9 @@ static void on_binding_ready_cb(void* user_data, const waywallen_binding_t* bind
     if (t->shadow_dmabuf_fd >= 0 && t->shadow_n_planes > 0) {
         self->shadow_valid = TRUE;
     }
+    if (self->native_listener.binding_ready) {
+        self->native_listener.binding_ready(self, binding, self->native_listener_data);
+    }
     g_signal_emit(self,
                   signals[SIGNAL_BINDING_READY],
                   0,
@@ -119,6 +124,9 @@ static void on_binding_ready_cb(void* user_data, const waywallen_binding_t* bind
 
 static void on_textures_releasing_cb(void* user_data, const waywallen_textures_t* t) {
     WwDisplay* self = WW_DISPLAY(user_data);
+    if (self->native_listener.textures_releasing) {
+        self->native_listener.textures_releasing(self, t, self->native_listener_data);
+    }
     if (self->shadow_buffer_generation == t->buffer_generation) {
         self->shadow_valid             = FALSE;
         self->shadow_fd                = -1;
@@ -134,6 +142,9 @@ static void on_composition_config_cb(void* user_data, const waywallen_compositio
      * MUST treat clear color as authoritative — it's owned by the
      * renderer and there's no display-side knob. */
     WwDisplay* self = WW_DISPLAY(user_data);
+    if (self->native_listener.composition_config) {
+        self->native_listener.composition_config(self, c, self->native_listener_data);
+    }
     g_signal_emit(self,
                   signals[SIGNAL_COMPOSITION_CONFIG],
                   0,
@@ -157,6 +168,12 @@ static void on_composition_config_cb(void* user_data, const waywallen_compositio
 static void on_frame_ready_cb(void* user_data, const waywallen_frame_t* f) {
     WwDisplay* self = WW_DISPLAY(user_data);
     gint       fd   = f->release_syncobj_fd;
+
+    if (self->native_listener.frame_ready) {
+        waywallen_frame_t frame = *f;
+        if (frame.release_syncobj_fd >= 0) frame.release_syncobj_fd = dup(frame.release_syncobj_fd);
+        self->native_listener.frame_ready(self, &frame, self->native_listener_data);
+    }
 
     g_signal_emit(self,
                   signals[SIGNAL_FRAME_READY],
@@ -184,6 +201,9 @@ static void on_presentation_snapshot_cb(void*                                   
     self->transition_origin_x            = presentation->config.transition.origin_x;
     self->transition_origin_y            = presentation->config.transition.origin_y;
     notify_presentation(self);
+    if (self->native_listener.presentation_snapshot) {
+        self->native_listener.presentation_snapshot(self, presentation, self->native_listener_data);
+    }
     g_signal_emit(self,
                   signals[SIGNAL_PRESENTATION_SNAPSHOT],
                   0,
@@ -454,6 +474,21 @@ static void ww_display_init(WwDisplay* self) {
 }
 
 WwDisplay* ww_display_new(void) { return g_object_new(WW_TYPE_DISPLAY, NULL); }
+
+void _ww_display_set_native_listener(WwDisplay* display, const WwDisplayNativeListener* listener,
+                                     void* user_data) {
+    g_return_if_fail(WW_IS_DISPLAY(display));
+    g_return_if_fail(! display->native_listener_data || display->native_listener_data == user_data);
+    display->native_listener      = listener ? *listener : (WwDisplayNativeListener) { 0 };
+    display->native_listener_data = listener ? user_data : NULL;
+}
+
+void _ww_display_clear_native_listener(WwDisplay* display, void* user_data) {
+    g_return_if_fail(WW_IS_DISPLAY(display));
+    if (display->native_listener_data != user_data) return;
+    display->native_listener      = (WwDisplayNativeListener) { 0 };
+    display->native_listener_data = NULL;
+}
 
 gboolean ww_display_bind_dmabuf_relay(WwDisplay* self) {
     g_return_val_if_fail(WW_IS_DISPLAY(self), FALSE);

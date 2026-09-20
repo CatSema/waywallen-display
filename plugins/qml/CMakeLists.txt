@@ -12,9 +12,6 @@ include(GNUInstallDirs)
 find_package(Qt6 6.2 REQUIRED COMPONENTS Quick Gui Qml DBus)
 find_package(Vulkan QUIET)
 
-# The C display library lives two levels up.
-set(WAYWALLEN_DISPLAY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-
 # CI builds the KDE kpackage with an alt URI so it doesn't collide with
 # a user's separately-installed Waywallen.Display module — Qt protects
 # a module URI after its first type registration, so two .so files
@@ -31,9 +28,14 @@ qt_add_qml_module(waywallen-display-qml
     PLUGIN_TARGET waywallen-display-qml
     SOURCES
         FrameSlotRetirement.hpp
-        PresentationState.hpp
+        RenderSessionResources.hpp
+        RenderSessionResources.cpp
+        QtPresentationTypes.hpp
+        QsgPresentationNode.hpp
+        QsgPresentationNode.cpp
         WaywallenDisplay.hpp
         WaywallenDisplay.cpp
+        WaywallenDisplayRender.cpp
         PluginInfo.hpp
     OUTPUT_DIRECTORY
         ${CMAKE_CURRENT_BINARY_DIR}/${_ww_qml_uri_path}
@@ -41,10 +43,6 @@ qt_add_qml_module(waywallen-display-qml
 
 if(Vulkan_FOUND)
     target_compile_definitions(waywallen-display-qml PRIVATE WW_HAVE_VULKAN=1)
-    # Pull in src/ for backend_vulkan_blit.h (internal header — the
-    # blitter symbols live in waywallen_display_static).
-    target_include_directories(waywallen-display-qml PRIVATE
-        ${WAYWALLEN_DISPLAY_DIR}/src)
 endif()
 
 # When built as a subdirectory of the top-level waywallen_display project,
