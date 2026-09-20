@@ -5,7 +5,9 @@
 #include <waywallen_display_protocol_types.h>
 
 #include <QColor>
+#include <QElapsedTimer>
 #include <QMutex>
+#include <QPointF>
 #include <QPointer>
 #include <QQuickItem>
 #include <QRectF>
@@ -115,9 +117,21 @@ public:
 
     enum PresentationCapability
     {
-        PauseBlurCapability = 1u << 0,
+        PauseBlurCapability      = 1u << 0,
+        FadeTransitionCapability = 1u << 1,
+        WipeTransitionCapability = 1u << 2,
+        GrowTransitionCapability = 1u << 3,
     };
     Q_ENUM(PresentationCapability)
+
+    enum TransitionKind
+    {
+        NoTransition   = WAYWALLEN_TRANSITION_KIND_NONE,
+        FadeTransition = WAYWALLEN_TRANSITION_KIND_FADE,
+        WipeTransition = WAYWALLEN_TRANSITION_KIND_WIPE,
+        GrowTransition = WAYWALLEN_TRANSITION_KIND_GROW,
+    };
+    Q_ENUM(TransitionKind)
 
     explicit WaywallenDisplay(QQuickItem* parent = nullptr);
     ~WaywallenDisplay() override;
@@ -210,6 +224,8 @@ private slots:
                                   const QString& newOwner);
     void onDaemonReadySignal();
     void onReconnectTimer();
+    void onAfterFrameEnd();
+    void advanceTransition();
     void pushSizeUpdate();
 
 private:
@@ -254,16 +270,18 @@ private:
     };
     /* Blit an imported GL texture into the current shadow or a separate
      * replacement. Render thread only. */
-    EglBlitResult blitEglShadow(int slot, int width, int height, bool forceReplace);
+    EglBlitResult blitEglShadow(int slot, int width, int height, bool forceReplace,
+                                bool reuseCandidate);
     void          releaseEglFrame(int releaseSyncobjFd, bool afterGpuWork, uint64_t generation,
                                   uint64_t seq);
     /* Render-thread job: drains m_pendingEgl, ensures GL textures,
      * runs blitEglShadow. Scheduled from c_on_frame_ready via
      * scheduleRenderJob(BeforeSynchronizingStage). */
     void renderThreadBlitEgl();
-    void commitPresentedContent(uint64_t generation, int width, int height, uint32_t fourcc,
-                                const ConfigSnapshot& config);
-    void publishPresentationCommit(qulonglong serial, const QColor& clearColor);
+    void armPresentationSubmission(qulonglong serial, bool transition);
+    void cancelTransition(bool settleCurrent);
+    bool transitionConfigured() const;
+    void publishPresentationCommit(const ContentSnapshot& content, bool contentChanged);
     void setPresentedClearColor(const QColor& color);
 
     // C callback trampolines.
@@ -305,6 +323,10 @@ private:
     bool            m_pauseEffectActive { false };
     qulonglong      m_presentationConfigGeneration { 0 };
     qulonglong      m_presentationStateGeneration { 0 };
+    TransitionKind  m_transitionKind { NoTransition };
+    int             m_transitionDurationMs { 400 };
+    quint32         m_transitionAngle { 0 };
+    QPointF         m_transitionOrigin { 0.5, 0.5 };
 
     mutable QMutex                          m_resourcesMutex;
     std::shared_ptr<RenderSessionResources> m_renderResources;
@@ -337,8 +359,27 @@ private:
     ActiveBackend m_activeBackend { BackendNone };
 
     PresentationState m_presentationState;
-    qulonglong        m_presentationSerial { 0 };
-    qulonglong        m_notifiedPresentationSerial { 0 };
+    qulonglong        m_candidatePrepareSerial { 0 };
+    qulonglong        m_promotionSerial { 0 };
+    bool              m_promotionUsesTransition { false };
+    qulonglong        m_frameSubmissionSerial { 0 };
+    bool              m_frameSubmissionUsesTransition { false };
+    ContentSnapshot   m_outgoingContent;
+    bool              m_transitionActive { false };
+    qulonglong        m_activeTransitionSerial { 0 };
+    qreal             m_transitionProgress { 1.0 };
+    TransitionKind    m_activeTransitionKind { NoTransition };
+    int               m_activeTransitionDurationMs { 0 };
+    quint32           m_activeTransitionAngle { 0 };
+    QPointF           m_activeTransitionOrigin { 0.5, 0.5 };
+    QElapsedTimer     m_transitionClock;
+    QTimer            m_transitionTimer;
+    qulonglong        m_renderFrameSerial { 0 };
+    qulonglong        m_presentedLastFrameSerial { 0 };
+    int               m_presentedLastFrameSlot { -1 };
+    qulonglong        m_transitionLastFrameSerial { 0 };
+    int               m_transitionLastFrameSlot { -1 };
+    int               m_retirementPumpBudget { 0 };
 
     // EGL texture state (GL textures created lazily on render thread).
     bool          m_eglImagesValid { false };
@@ -395,6 +436,7 @@ private:
         uint64_t bufferGeneration { 0 };
         uint64_t seq { 0 };
     };
-    PendingVkFrame m_pendingVk;
+    PendingVkFrame  m_pendingVk;
+    ContentSnapshot m_preparedVkContent;
 #endif
 };

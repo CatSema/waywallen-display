@@ -12,6 +12,9 @@ Item {
 
         autoReconnect: true
         presentationCapabilities: P.PluginDisplay.PauseBlurCapability
+                                  | P.PluginDisplay.FadeTransitionCapability
+                                  | P.PluginDisplay.WipeTransitionCapability
+                                  | P.PluginDisplay.GrowTransitionCapability
     }
 
     Loader {

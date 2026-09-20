@@ -892,10 +892,11 @@ int ww_vk_blitter_discard_candidate(ww_vk_blitter_t* b) {
     return 0;
 }
 
-int ww_vk_blitter_prepare(ww_vk_blitter_t* b, VkImage imported, uint32_t w, uint32_t h,
-                          uint32_t fourcc, bool force_replace, VkSemaphore acquire_sem,
-                          int release_syncobj_fd, bool* out_candidate_ready,
-                          bool* out_release_armed) {
+int ww_vk_blitter_prepare_reusing_candidate(ww_vk_blitter_t* b, VkImage imported, uint32_t w,
+                                            uint32_t h, uint32_t fourcc, bool force_replace,
+                                            bool reuse_candidate, VkSemaphore acquire_sem,
+                                            int release_syncobj_fd, bool* out_candidate_ready,
+                                            bool* out_release_armed) {
     if (out_candidate_ready) *out_candidate_ready = false;
     if (out_release_armed) *out_release_armed = false;
     const VkFormat fmt = ww_fourcc_to_vk_format(fourcc);
@@ -903,6 +904,24 @@ int ww_vk_blitter_prepare(ww_vk_blitter_t* b, VkImage imported, uint32_t w, uint
         resolve_unused_release(release_syncobj_fd, out_release_armed);
         return -EINVAL;
     }
+    if (reuse_candidate && b->candidate_image != VK_NULL_HANDLE && b->candidate_w == w &&
+        b->candidate_h == h && b->candidate_fmt == fmt) {
+        const int rc = blit_to_shadow(b,
+                                      b->candidate_image,
+                                      -1,
+                                      imported,
+                                      w,
+                                      h,
+                                      acquire_sem,
+                                      release_syncobj_fd,
+                                      out_release_armed);
+        if (rc == 0) {
+            b->candidate_has_content = true;
+            if (out_candidate_ready) *out_candidate_ready = true;
+        }
+        return rc;
+    }
+
     int rc = ww_vk_blitter_discard_candidate(b);
     if (rc != 0) {
         resolve_unused_release(release_syncobj_fd, out_release_armed);
@@ -943,13 +962,47 @@ int ww_vk_blitter_prepare(ww_vk_blitter_t* b, VkImage imported, uint32_t w, uint
     return 0;
 }
 
-VkResult ww_vk_blitter_commit_candidate(ww_vk_blitter_t* b) {
-    if (! b || ! b->initialized || b->candidate_image == VK_NULL_HANDLE ||
+int ww_vk_blitter_prepare(ww_vk_blitter_t* b, VkImage imported, uint32_t w, uint32_t h,
+                          uint32_t fourcc, bool force_replace, VkSemaphore acquire_sem,
+                          int release_syncobj_fd, bool* out_candidate_ready,
+                          bool* out_release_armed) {
+    return ww_vk_blitter_prepare_reusing_candidate(b,
+                                                   imported,
+                                                   w,
+                                                   h,
+                                                   fourcc,
+                                                   force_replace,
+                                                   false,
+                                                   acquire_sem,
+                                                   release_syncobj_fd,
+                                                   out_candidate_ready,
+                                                   out_release_armed);
+}
+
+static void clear_retained_shadow(ww_vk_retained_shadow_t* retained) {
+    if (! retained) return;
+    memset(retained, 0, sizeof(*retained));
+    retained->format = VK_FORMAT_UNDEFINED;
+    retained->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+VkResult ww_vk_blitter_commit_candidate_retaining(ww_vk_blitter_t*         b,
+                                                  ww_vk_retained_shadow_t* out_retained) {
+    if (! b || ! b->initialized || ! out_retained || out_retained->image != VK_NULL_HANDLE ||
+        out_retained->memory != VK_NULL_HANDLE || b->candidate_image == VK_NULL_HANDLE ||
         ! b->candidate_has_content) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    destroy_shadow_handles(b, b->shadow_image, b->shadow_mem);
+    out_retained->image           = b->shadow_image;
+    out_retained->memory          = b->shadow_mem;
+    out_retained->width           = b->shadow_w;
+    out_retained->height          = b->shadow_h;
+    out_retained->format          = b->shadow_fmt;
+    out_retained->layout          = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    out_retained->allocation_size = b->shadow_allocation_size;
+    out_retained->has_content     = b->shadow_has_content;
+
     b->shadow_image           = b->candidate_image;
     b->shadow_mem             = b->candidate_mem;
     b->shadow_w               = b->candidate_w;
@@ -966,6 +1019,19 @@ VkResult ww_vk_blitter_commit_candidate(ww_vk_blitter_t* b) {
     b->candidate_allocation_size = 0;
     b->candidate_has_content     = false;
     return VK_SUCCESS;
+}
+
+void ww_vk_blitter_release_retained(ww_vk_blitter_t* b, ww_vk_retained_shadow_t* retained) {
+    if (! retained) return;
+    if (b && b->initialized) destroy_shadow_handles(b, retained->image, retained->memory);
+    clear_retained_shadow(retained);
+}
+
+VkResult ww_vk_blitter_commit_candidate(ww_vk_blitter_t* b) {
+    ww_vk_retained_shadow_t retained = { 0 };
+    const VkResult          result   = ww_vk_blitter_commit_candidate_retaining(b, &retained);
+    if (result == VK_SUCCESS) ww_vk_blitter_release_retained(b, &retained);
+    return result;
 }
 
 int ww_vk_blitter_drain_pending_release(ww_vk_blitter_t* b, bool* out_release_armed) {

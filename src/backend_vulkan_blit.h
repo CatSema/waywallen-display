@@ -106,6 +106,17 @@ typedef struct ww_vk_blitter {
     bool initialized;
 } ww_vk_blitter_t;
 
+typedef struct ww_vk_retained_shadow {
+    VkImage        image;
+    VkDeviceMemory memory;
+    uint32_t       width;
+    uint32_t       height;
+    VkFormat       format;
+    VkImageLayout  layout;
+    VkDeviceSize   allocation_size;
+    bool           has_content;
+} ww_vk_retained_shadow_t;
+
 /*
  * Initialize. Returns 0 on success, negative errno on failure (struct
  * left zeroed). `host_get_proc` is the same callback shape backend_vulkan
@@ -176,9 +187,25 @@ int ww_vk_blitter_prepare(ww_vk_blitter_t* b, VkImage imported, uint32_t w, uint
                           int release_syncobj_fd, bool* out_candidate_ready,
                           bool* out_release_armed);
 
+/* As ww_vk_blitter_prepare, but update an already allocated candidate
+ * when it belongs to the same queued binding. */
+int ww_vk_blitter_prepare_reusing_candidate(ww_vk_blitter_t* b, VkImage imported, uint32_t w,
+                                            uint32_t h, uint32_t fourcc, bool force_replace,
+                                            bool reuse_candidate, VkSemaphore acquire_sem,
+                                            int release_syncobj_fd, bool* out_candidate_ready,
+                                            bool* out_release_armed);
+
 /* Promote a prepared candidate after the host has completed submissions
  * referencing the previous image and released its image views. */
 VkResult ww_vk_blitter_commit_candidate(ww_vk_blitter_t* b);
+
+/* Promote the candidate while transferring the previous current shadow
+ * into `out_retained`. The destination must be empty. */
+VkResult ww_vk_blitter_commit_candidate_retaining(ww_vk_blitter_t*         b,
+                                                  ww_vk_retained_shadow_t* out_retained);
+
+/* Release a shadow previously returned by commit_candidate_retaining. */
+void ww_vk_blitter_release_retained(ww_vk_blitter_t* b, ww_vk_retained_shadow_t* retained);
 
 /* Destroy a prepared candidate without changing the current shadow.
  * Returns -EBUSY when a timed-out copy still references it. */

@@ -1,4 +1,5 @@
 #include "WaywallenDisplay.hpp"
+#include "FrameSlotRetirement.hpp"
 
 #include <waywallen_display.h>
 
@@ -7,6 +8,7 @@
 #include <QDBusMessage>
 #include <QDebug>
 #include <QLoggingCategory>
+#include <QLineF>
 #include <QMatrix4x4>
 #include <QMouseEvent>
 #include <QOpenGLContext>
@@ -16,6 +18,8 @@
 #include <QRunnable>
 #include <QScreen>
 #include <QSGImageNode>
+#include <QSGGeometry>
+#include <QSGOpacityNode>
 #include <QSGRectangleNode>
 #include <QSGRendererInterface>
 #include <QSGTransformNode>
@@ -25,6 +29,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <cerrno>
+#include <cmath>
 #include <limits>
 #include <utility>
 #include <unistd.h>
@@ -39,6 +44,14 @@ constexpr int kReconnectMaxDelayMs     = 30000;
 
 class RenderSessionResources {
 public:
+    struct EglShadow {
+        uint texture { 0 };
+        uint framebuffer { 0 };
+        int  width { 0 };
+        int  height { 0 };
+        bool hasContent { false };
+    };
+
     ~RenderSessionResources() {
         if (display) {
             qCCritical(lcWD,
@@ -50,6 +63,11 @@ public:
     void shutdown() {
 #ifdef WW_HAVE_VULKAN
         if (vkBlitterInited) {
+            (void)ww_vk_blitter_drain_pending_release(&vkBlitter, nullptr);
+            ww_vk_blitter_release_retained(&vkBlitter, &vkOutgoing);
+            vkRetired.drain([this](ww_vk_retained_shadow_t& shadow) {
+                ww_vk_blitter_release_retained(&vkBlitter, &shadow);
+            });
             ww_vk_blitter_shutdown(&vkBlitter);
             vkBlitterInited = false;
         }
@@ -67,81 +85,106 @@ public:
         if (ctx) {
             auto* gl = ctx->extraFunctions();
             if (gl) {
-                if (eglShadowFbo) gl->glDeleteFramebuffers(1, &eglShadowFbo);
-                if (eglCandidateFbo) gl->glDeleteFramebuffers(1, &eglCandidateFbo);
+                destroyEgl(gl, eglCurrent);
+                destroyEgl(gl, eglCandidate);
+                destroyEgl(gl, eglOutgoing);
+                eglRetired.drain([gl](EglShadow& shadow) {
+                    destroyEgl(gl, shadow);
+                });
                 if (eglReadFbo) gl->glDeleteFramebuffers(1, &eglReadFbo);
-                if (eglShadowTex) gl->glDeleteTextures(1, &eglShadowTex);
-                if (eglCandidateTex) gl->glDeleteTextures(1, &eglCandidateTex);
             }
         }
-        eglShadowFbo           = 0;
-        eglReadFbo             = 0;
-        eglShadowTex           = 0;
-        eglCandidateFbo        = 0;
-        eglCandidateTex        = 0;
-        eglCandidateW          = 0;
-        eglCandidateH          = 0;
-        eglShadowW             = 0;
-        eglShadowH             = 0;
-        eglShadowHasContent    = false;
-        eglCandidateHasContent = false;
+        eglCurrent   = EglShadow {};
+        eglCandidate = EglShadow {};
+        eglOutgoing  = EglShadow {};
+        eglReadFbo   = 0;
     }
 
     bool discardEglCandidate() {
-        if (! eglCandidateTex && ! eglCandidateFbo) return true;
+        if (! eglCandidate.texture && ! eglCandidate.framebuffer) return true;
         auto* ctx = QOpenGLContext::currentContext();
         auto* gl  = ctx ? ctx->extraFunctions() : nullptr;
         if (! gl) return false;
-        if (eglCandidateFbo) gl->glDeleteFramebuffers(1, &eglCandidateFbo);
-        if (eglCandidateTex) gl->glDeleteTextures(1, &eglCandidateTex);
-        eglCandidateFbo        = 0;
-        eglCandidateTex        = 0;
-        eglCandidateW          = 0;
-        eglCandidateH          = 0;
-        eglCandidateHasContent = false;
+        destroyEgl(gl, eglCandidate);
         return true;
     }
 
-    bool commitEglCandidate() {
-        if (! eglCandidateTex || ! eglCandidateFbo || ! eglCandidateHasContent) return false;
+    bool commitEglCandidateRetaining() {
+        if (! eglCandidate.texture || ! eglCandidate.framebuffer || ! eglCandidate.hasContent ||
+            eglOutgoing.texture || eglOutgoing.framebuffer) {
+            return false;
+        }
+        eglOutgoing = std::exchange(eglCurrent, EglShadow {});
+        eglCurrent  = std::exchange(eglCandidate, EglShadow {});
+        return true;
+    }
+
+    bool hasOutgoing() const {
+        bool present = eglOutgoing.texture != 0 || eglOutgoing.framebuffer != 0;
+#ifdef WW_HAVE_VULKAN
+        present =
+            present || vkOutgoing.image != VK_NULL_HANDLE || vkOutgoing.memory != VK_NULL_HANDLE;
+#endif
+        return present;
+    }
+
+    void retireOutgoing(const FrameSlotRetirement& retirement) {
+        if (eglOutgoing.texture || eglOutgoing.framebuffer) {
+            eglRetired.retire(std::exchange(eglOutgoing, EglShadow {}), retirement);
+        }
+#ifdef WW_HAVE_VULKAN
+        if (vkOutgoing.image != VK_NULL_HANDLE || vkOutgoing.memory != VK_NULL_HANDLE) {
+            vkRetired.retire(std::exchange(vkOutgoing, ww_vk_retained_shadow_t {}), retirement);
+        }
+#endif
+    }
+
+    bool collectRetired(int frameSlot, std::uint64_t frameSerial) {
         auto* ctx = QOpenGLContext::currentContext();
         auto* gl  = ctx ? ctx->extraFunctions() : nullptr;
-        if ((eglShadowTex || eglShadowFbo) && ! gl) return false;
-
-        const uint oldFbo      = eglShadowFbo;
-        const uint oldTex      = eglShadowTex;
-        eglShadowFbo           = eglCandidateFbo;
-        eglShadowTex           = eglCandidateTex;
-        eglShadowW             = eglCandidateW;
-        eglShadowH             = eglCandidateH;
-        eglShadowHasContent    = true;
-        eglCandidateFbo        = 0;
-        eglCandidateTex        = 0;
-        eglCandidateW          = 0;
-        eglCandidateH          = 0;
-        eglCandidateHasContent = false;
-
-        if (oldFbo) gl->glDeleteFramebuffers(1, &oldFbo);
-        if (oldTex) gl->glDeleteTextures(1, &oldTex);
-        return true;
+        if (gl) {
+            eglRetired.collect(frameSlot, frameSerial, [gl](EglShadow& shadow) {
+                destroyEgl(gl, shadow);
+            });
+        }
+#ifdef WW_HAVE_VULKAN
+        if (vkBlitterInited) {
+            vkRetired.collect(frameSlot, frameSerial, [this](ww_vk_retained_shadow_t& shadow) {
+                ww_vk_blitter_release_retained(&vkBlitter, &shadow);
+            });
+        }
+#endif
+        bool pending = ! eglRetired.empty();
+#ifdef WW_HAVE_VULKAN
+        pending = pending || ! vkRetired.empty();
+#endif
+        return pending;
     }
 
+private:
+    static void destroyEgl(QOpenGLExtraFunctions* gl, EglShadow& shadow) {
+        if (shadow.framebuffer) gl->glDeleteFramebuffers(1, &shadow.framebuffer);
+        if (shadow.texture) gl->glDeleteTextures(1, &shadow.texture);
+        shadow = EglShadow {};
+    }
+
+    FrameSlotRetirementQueue<EglShadow> eglRetired;
+
+#ifdef WW_HAVE_VULKAN
+    FrameSlotRetirementQueue<ww_vk_retained_shadow_t> vkRetired;
+#endif
+
+public:
     waywallen_display_t* display { nullptr };
-    uint                 eglShadowTex { 0 };
-    uint                 eglShadowFbo { 0 };
+    EglShadow            eglCurrent;
+    EglShadow            eglCandidate;
+    EglShadow            eglOutgoing;
     uint                 eglReadFbo { 0 };
-    int                  eglShadowW { 0 };
-    int                  eglShadowH { 0 };
-    bool                 eglShadowHasContent { false };
-    uint                 eglCandidateTex { 0 };
-    uint                 eglCandidateFbo { 0 };
-    int                  eglCandidateW { 0 };
-    int                  eglCandidateH { 0 };
-    bool                 eglCandidateHasContent { false };
     void*                eglDisplay { nullptr };
 #ifdef WW_HAVE_VULKAN
-    ww_vk_blitter_t vkBlitter {};
-    bool            vkBlitterInited { false };
+    ww_vk_blitter_t         vkBlitter {};
+    bool                    vkBlitterInited { false };
+    ww_vk_retained_shadow_t vkOutgoing {};
 #endif
 };
 
@@ -226,6 +269,240 @@ private:
         appendChildNode(transformNode);
         transformNode->appendChildNode(imageNode);
     }
+};
+
+class TransitionNode final : public QSGNode {
+public:
+    static TransitionNode* create(QQuickWindow* window, qulonglong serial, QSGTexture* outgoing,
+                                  QSGTexture* incoming) {
+        if (! window || ! outgoing || ! incoming) {
+            delete outgoing;
+            delete incoming;
+            return nullptr;
+        }
+        auto* outgoingClear = window->createRectangleNode();
+        auto* outgoingNode  = window->createImageNode();
+        auto* incomingClear = window->createRectangleNode();
+        auto* incomingNode  = window->createImageNode();
+        if (! outgoingClear || ! outgoingNode || ! incomingClear || ! incomingNode) {
+            delete outgoingClear;
+            delete outgoingNode;
+            delete incomingClear;
+            delete incomingNode;
+            delete outgoing;
+            delete incoming;
+            return nullptr;
+        }
+        return new TransitionNode(
+            serial, outgoingClear, outgoing, outgoingNode, incomingClear, incoming, incomingNode);
+    }
+
+    qulonglong serial() const { return m_serial; }
+
+    void updateScene(WaywallenDisplay::TransitionKind kind, qreal progress, quint32 angle,
+                     const QPointF& origin, const QRectF& bounds,
+                     const PresentationState::Content& outgoingContent,
+                     const PresentationState::Content& incomingContent, int displayWidth,
+                     int displayHeight) {
+        m_outgoingClear->setRect(bounds);
+        m_outgoingClear->setColor(outgoingContent.config.clearColor);
+        configureImage(m_outgoingNode,
+                       m_outgoingTransform,
+                       outgoingContent,
+                       bounds,
+                       displayWidth,
+                       displayHeight);
+
+        m_incomingClear->setRect(bounds);
+        m_incomingClear->setColor(incomingContent.config.clearColor);
+        configureImage(m_incomingNode,
+                       m_incomingTransform,
+                       incomingContent,
+                       bounds,
+                       displayWidth,
+                       displayHeight);
+        updateClip(kind, progress, angle, origin, bounds);
+    }
+
+private:
+    TransitionNode(qulonglong serial, QSGRectangleNode* outgoingClear, QSGTexture* outgoingTexture,
+                   QSGImageNode* outgoingNode, QSGRectangleNode* incomingClear,
+                   QSGTexture* incomingTexture, QSGImageNode* incomingNode)
+        : m_serial(serial),
+          m_outgoingClear(outgoingClear),
+          m_outgoingNode(outgoingNode),
+          m_incomingClear(incomingClear),
+          m_incomingNode(incomingNode),
+          m_clipGeometry(new QSGGeometry(QSGGeometry::defaultAttributes_Point2D(), 100)) {
+        m_outgoingNode->setTexture(outgoingTexture);
+        m_outgoingNode->setOwnsTexture(true);
+        m_outgoingNode->setFiltering(QSGTexture::Linear);
+        m_incomingNode->setTexture(incomingTexture);
+        m_incomingNode->setOwnsTexture(true);
+        m_incomingNode->setFiltering(QSGTexture::Linear);
+
+        m_incomingOpacity   = new QSGOpacityNode();
+        m_clipNode          = new QSGClipNode();
+        m_outgoingTransform = new QSGTransformNode();
+        m_incomingTransform = new QSGTransformNode();
+        m_clipGeometry->setDrawingMode(QSGGeometry::DrawTriangleFan);
+        m_clipGeometry->setVertexDataPattern(QSGGeometry::DynamicPattern);
+        m_clipNode->setGeometry(m_clipGeometry);
+        m_clipNode->setFlag(QSGNode::OwnsGeometry);
+
+        appendChildNode(m_outgoingClear);
+        appendChildNode(m_outgoingTransform);
+        m_outgoingTransform->appendChildNode(m_outgoingNode);
+        appendChildNode(m_incomingOpacity);
+        m_incomingOpacity->appendChildNode(m_clipNode);
+        m_clipNode->appendChildNode(m_incomingClear);
+        m_clipNode->appendChildNode(m_incomingTransform);
+        m_incomingTransform->appendChildNode(m_incomingNode);
+    }
+
+    static void configureImage(QSGImageNode* imageNode, QSGTransformNode* transformNode,
+                               const PresentationState::Content& content, const QRectF& bounds,
+                               int displayWidth, int displayHeight) {
+        if (content.config.sourceRect.width() > 0 && content.config.sourceRect.height() > 0) {
+            imageNode->setSourceRect(content.config.sourceRect);
+        } else {
+            imageNode->setSourceRect(QRectF(0, 0, content.width, content.height));
+        }
+
+        if (content.config.destRect.width() > 0 && content.config.destRect.height() > 0 &&
+            displayWidth > 0 && displayHeight > 0) {
+            const qreal sx = bounds.width() / qreal(displayWidth);
+            const qreal sy = bounds.height() / qreal(displayHeight);
+            imageNode->setRect(QRectF(content.config.destRect.x() * sx,
+                                      content.config.destRect.y() * sy,
+                                      content.config.destRect.width() * sx,
+                                      content.config.destRect.height() * sy));
+        } else {
+            imageNode->setRect(bounds);
+        }
+
+        QMatrix4x4 matrix;
+        if (content.config.transform != 0) {
+            const qreal width    = bounds.width();
+            const qreal height   = bounds.height();
+            const bool  swap     = content.config.transform == 1 || content.config.transform == 3 ||
+                                   content.config.transform == 5 || content.config.transform == 7;
+            const qreal preWidth = swap ? height : width;
+            const qreal preHeight = swap ? width : height;
+            const auto  transform = content.config.transform;
+            matrix.translate(static_cast<float>(width / 2.0), static_cast<float>(height / 2.0));
+            if (transform >= 4) matrix.scale(-1.0f, 1.0f);
+            matrix.rotate(static_cast<float>((transform >= 4 ? transform - 4 : transform) * 90u),
+                          0.0f,
+                          0.0f,
+                          1.0f);
+            matrix.translate(static_cast<float>(-preWidth / 2.0),
+                             static_cast<float>(-preHeight / 2.0));
+        }
+        if (transformNode->matrix() != matrix) {
+            transformNode->setMatrix(matrix);
+            transformNode->markDirty(QSGNode::DirtyMatrix);
+        }
+    }
+
+    void updateClip(WaywallenDisplay::TransitionKind kind, qreal progress, quint32 angle,
+                    const QPointF& origin, const QRectF& bounds) {
+        progress = qBound<qreal>(0.0, progress, 1.0);
+        if (kind == WaywallenDisplay::FadeTransition) {
+            m_incomingOpacity->setOpacity(progress);
+            m_clipNode->setIsRectangular(true);
+            m_clipNode->setClipRect(bounds);
+            return;
+        }
+
+        m_incomingOpacity->setOpacity(progress <= 0.0 ? 0.0 : 1.0);
+        if (progress >= 1.0) {
+            m_clipNode->setIsRectangular(true);
+            m_clipNode->setClipRect(bounds);
+            return;
+        }
+        m_clipNode->setIsRectangular(false);
+
+        if (kind == WaywallenDisplay::WipeTransition) {
+            QVector<QPointF> polygon {
+                bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft()
+            };
+            constexpr qreal pi      = 3.14159265358979323846;
+            const qreal     radians = qreal(angle % 360u) * pi / 180.0;
+            const QPointF   gradient(std::cos(radians), std::sin(radians));
+            auto            distance = [&gradient](const QPointF& point) {
+                return point.x() * gradient.x() + point.y() * gradient.y();
+            };
+            qreal minimum = std::numeric_limits<qreal>::max();
+            qreal maximum = std::numeric_limits<qreal>::lowest();
+            for (const auto& point : polygon) {
+                minimum = qMin(minimum, distance(point));
+                maximum = qMax(maximum, distance(point));
+            }
+            const qreal      threshold = minimum + (maximum - minimum) * progress;
+            QVector<QPointF> clipped;
+            for (int index = 0; index < polygon.size(); ++index) {
+                const QPointF current  = polygon[index];
+                const QPointF previous = polygon[(index + polygon.size() - 1) % polygon.size()];
+                const qreal   currentDistance  = distance(current) - threshold;
+                const qreal   previousDistance = distance(previous) - threshold;
+                const bool    currentInside    = currentDistance <= 0.0;
+                const bool    previousInside   = previousDistance <= 0.0;
+                if (currentInside != previousInside) {
+                    const qreal denominator = previousDistance - currentDistance;
+                    const qreal factor =
+                        qFuzzyIsNull(denominator) ? 0.0 : previousDistance / denominator;
+                    clipped.push_back(previous + (current - previous) * factor);
+                }
+                if (currentInside) clipped.push_back(current);
+            }
+            setClipPolygon(clipped);
+            return;
+        }
+
+        constexpr int segmentCount = 96;
+        const QPointF center(bounds.left() + bounds.width() * origin.x(),
+                             bounds.top() + bounds.height() * origin.y());
+        const QPointF corners[] {
+            bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft()
+        };
+        qreal reach = 1.0;
+        for (const auto& corner : corners) {
+            reach = qMax(reach, QLineF(center, corner).length());
+        }
+        constexpr qreal pi     = 3.14159265358979323846;
+        const qreal     radius = reach * progress / std::cos(pi / segmentCount);
+        auto*           points = m_clipGeometry->vertexDataAsPoint2D();
+        points[0].set(static_cast<float>(center.x()), static_cast<float>(center.y()));
+        for (int index = 0; index <= segmentCount; ++index) {
+            const qreal radians = 2.0 * pi * qreal(index) / qreal(segmentCount);
+            points[index + 1].set(static_cast<float>(center.x() + radius * std::cos(radians)),
+                                  static_cast<float>(center.y() + radius * std::sin(radians)));
+        }
+        m_clipGeometry->setVertexCount(segmentCount + 2);
+        m_clipNode->markDirty(QSGNode::DirtyGeometry);
+    }
+
+    void setClipPolygon(const QVector<QPointF>& polygon) {
+        auto* points = m_clipGeometry->vertexDataAsPoint2D();
+        for (int index = 0; index < polygon.size(); ++index) {
+            points[index].set(static_cast<float>(polygon[index].x()),
+                              static_cast<float>(polygon[index].y()));
+        }
+        m_clipGeometry->setVertexCount(polygon.size());
+        m_clipNode->markDirty(QSGNode::DirtyGeometry);
+    }
+
+    qulonglong        m_serial { 0 };
+    QSGRectangleNode* m_outgoingClear { nullptr };
+    QSGTransformNode* m_outgoingTransform { nullptr };
+    QSGImageNode*     m_outgoingNode { nullptr };
+    QSGOpacityNode*   m_incomingOpacity { nullptr };
+    QSGClipNode*      m_clipNode { nullptr };
+    QSGRectangleNode* m_incomingClear { nullptr };
+    QSGTransformNode* m_incomingTransform { nullptr };
+    QSGImageNode*     m_incomingNode { nullptr };
+    QSGGeometry*      m_clipGeometry { nullptr };
 };
 
 QString screenPart(const QString& value) { return value.trimmed(); }
@@ -336,6 +613,8 @@ void WaywallenDisplay::c_on_binding_ready(void* ud, const waywallen_binding_t* b
     {
         QMutexLocker lk(&self->m_pendingMutex);
         self->m_presentationState.beginIncoming(t->buffer_generation,
+                                                binding->content_token,
+                                                binding->presentation_config_generation,
                                                 static_cast<int>(t->tex_width),
                                                 static_cast<int>(t->tex_height),
                                                 t->fourcc,
@@ -368,6 +647,20 @@ void WaywallenDisplay::c_on_textures_releasing(void* ud, const waywallen_texture
         self->m_presentationState.retireIncoming(t->buffer_generation);
         if (self->m_preparedEglContent.bufferGeneration == t->buffer_generation) {
             self->m_preparedEglContent = ContentSnapshot {};
+        }
+#ifdef WW_HAVE_VULKAN
+        if (self->m_preparedVkContent.bufferGeneration == t->buffer_generation) {
+            self->m_preparedVkContent = ContentSnapshot {};
+        }
+#endif
+        ContentSnapshot prepared;
+        bool            transition = false;
+        if (self->m_candidatePrepareSerial != 0 &&
+            ! self->m_presentationState.prepared(
+                self->m_candidatePrepareSerial, prepared, transition)) {
+            self->m_candidatePrepareSerial  = 0;
+            self->m_promotionSerial         = 0;
+            self->m_promotionUsesTransition = false;
         }
     }
     self->m_vkImagesValid = false;
@@ -410,7 +703,7 @@ void WaywallenDisplay::c_on_composition_config(void*                            
                       qulonglong(composition->buffer_generation));
             return;
         }
-        updatesPresented = result == PresentationState::ConfigResult::PresentedUpdated;
+        updatesPresented = result == PresentationState::ConfigResult::DisplayedUpdated;
     }
     if (updatesPresented) {
         self->setPresentedClearColor(config.clearColor);
@@ -538,6 +831,9 @@ WaywallenDisplay::WaywallenDisplay(QQuickItem* parent): QQuickItem(parent) {
 
     m_reconnectTimer.setSingleShot(true);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &WaywallenDisplay::onReconnectTimer);
+
+    m_transitionTimer.setInterval(16);
+    connect(&m_transitionTimer, &QTimer::timeout, this, &WaywallenDisplay::advanceTransition);
 }
 
 WaywallenDisplay::~WaywallenDisplay() { cleanup(); }
@@ -634,10 +930,27 @@ void WaywallenDisplay::cleanup() {
     bool hadPresentedContent = false;
     {
         QMutexLocker lk(&m_pendingMutex);
-        hadPresentedContent = m_presentationState.presented().valid;
+        hadPresentedContent = m_presentationState.displayed().valid;
         m_presentationState.reset();
-        m_preparedEglContent         = ContentSnapshot {};
-        m_notifiedPresentationSerial = m_presentationSerial;
+        m_preparedEglContent = ContentSnapshot {};
+#ifdef WW_HAVE_VULKAN
+        m_preparedVkContent = ContentSnapshot {};
+#endif
+        m_candidatePrepareSerial        = 0;
+        m_promotionSerial               = 0;
+        m_frameSubmissionSerial         = 0;
+        m_promotionUsesTransition       = false;
+        m_frameSubmissionUsesTransition = false;
+        m_outgoingContent               = ContentSnapshot {};
+        m_transitionActive              = false;
+        m_activeTransitionSerial        = 0;
+        m_transitionProgress            = 1.0;
+        m_renderFrameSerial             = 0;
+        m_presentedLastFrameSerial      = 0;
+        m_presentedLastFrameSlot        = -1;
+        m_transitionLastFrameSerial     = 0;
+        m_transitionLastFrameSlot       = -1;
+        m_retirementPumpBudget          = 0;
     }
     m_textureCount  = 0;
     m_activeBackend = BackendNone;
@@ -661,39 +974,151 @@ void WaywallenDisplay::setPresentedClearColor(const QColor& color) {
     emit clearColorChanged();
 }
 
-void WaywallenDisplay::publishPresentationCommit(qulonglong serial, const QColor& clearColor) {
-    {
-        QMutexLocker lk(&m_pendingMutex);
-        if (serial <= m_notifiedPresentationSerial) return;
-        m_notifiedPresentationSerial = serial;
-    }
-    setPresentedClearColor(clearColor);
+void WaywallenDisplay::publishPresentationCommit(const ContentSnapshot& content,
+                                                 bool                   contentChanged) {
+    Q_UNUSED(contentChanged);
+    setPresentedClearColor(content.config.clearColor);
     m_contentRevision++;
     emit contentRevisionChanged();
 }
 
+bool WaywallenDisplay::transitionConfigured() const { return m_transitionKind != NoTransition; }
+
+void WaywallenDisplay::armPresentationSubmission(qulonglong serial, bool transition) {
+    QMutexLocker lock(&m_pendingMutex);
+    m_frameSubmissionSerial         = serial;
+    m_frameSubmissionUsesTransition = transition;
+}
+
+void WaywallenDisplay::onAfterFrameEnd() {
+    ContentSnapshot                 accepted;
+    PresentationState::AcceptResult result          = PresentationState::AcceptResult::Rejected;
+    bool                            startTransition = false;
+    {
+        QMutexLocker lock(&m_pendingMutex);
+        if (m_frameSubmissionSerial == 0) return;
+        const qulonglong serial = m_frameSubmissionSerial;
+        m_frameSubmissionSerial = 0;
+        result                  = m_presentationState.accept(serial, accepted);
+        startTransition         = result != PresentationState::AcceptResult::Rejected &&
+                                  m_frameSubmissionUsesTransition && transitionConfigured() &&
+                                  m_outgoingContent.valid;
+        m_frameSubmissionUsesTransition = false;
+        if (startTransition) {
+            m_presentationState.setTransitionActive(true);
+            m_transitionActive   = true;
+            m_transitionProgress = 0.0;
+            m_transitionClock.start();
+        } else if (result != PresentationState::AcceptResult::Rejected) {
+            m_transitionActive = false;
+            m_presentationState.setTransitionActive(false);
+            m_activeTransitionSerial = 0;
+            m_transitionProgress     = 1.0;
+        }
+    }
+    if (result == PresentationState::AcceptResult::Rejected) return;
+    publishPresentationCommit(accepted, result == PresentationState::AcceptResult::ContentChanged);
+    if (startTransition) m_transitionTimer.start();
+    update();
+}
+
+void WaywallenDisplay::advanceTransition() {
+    bool finished = false;
+    {
+        QMutexLocker lock(&m_pendingMutex);
+        if (! m_transitionActive) {
+            m_transitionTimer.stop();
+            return;
+        }
+        const qreal duration = qMax(1, m_activeTransitionDurationMs);
+        const qreal linear   = qBound<qreal>(0.0, m_transitionClock.elapsed() / duration, 1.0);
+        if (linear < 0.5) {
+            m_transitionProgress = 4.0 * linear * linear * linear;
+        } else {
+            const qreal inverse  = -2.0 * linear + 2.0;
+            m_transitionProgress = 1.0 - inverse * inverse * inverse / 2.0;
+        }
+        finished = linear >= 1.0;
+        if (finished) {
+            m_transitionActive = false;
+            m_presentationState.setTransitionActive(false);
+            m_activeTransitionSerial = 0;
+            m_transitionProgress     = 1.0;
+        }
+    }
+    if (finished) m_transitionTimer.stop();
+    update();
+}
+
+void WaywallenDisplay::cancelTransition(bool settleCurrent) {
+    {
+        QMutexLocker lock(&m_pendingMutex);
+        if (m_candidatePrepareSerial != 0) {
+            (void)m_presentationState.discard(m_candidatePrepareSerial);
+        }
+        m_candidatePrepareSerial  = 0;
+        m_promotionSerial         = 0;
+        m_promotionUsesTransition = false;
+        if (! settleCurrent) m_frameSubmissionSerial = 0;
+        m_frameSubmissionUsesTransition = false;
+        m_transitionActive              = false;
+        m_presentationState.setTransitionActive(false);
+        m_activeTransitionSerial = 0;
+        m_transitionProgress     = 1.0;
+    }
+    m_transitionTimer.stop();
+    if (settleCurrent) update();
+}
+
 void WaywallenDisplay::applyPresentationSnapshot(
     const waywallen_presentation_snapshot_t& presentation) {
-    const auto kind = static_cast<PauseEffectKind>(presentation.config.pause_effect.kind);
+    const auto kind           = static_cast<PauseEffectKind>(presentation.config.pause_effect.kind);
+    const auto transitionKind = static_cast<TransitionKind>(presentation.config.transition.kind);
     const bool changed =
         m_pauseEffectKind != kind ||
         m_blurRadius != static_cast<int>(presentation.config.pause_effect.blur.radius) ||
         m_pauseEffectActive != presentation.state.pause_effect.active ||
         m_presentationConfigGeneration != presentation.config.generation ||
-        m_presentationStateGeneration != presentation.state.generation;
+        m_presentationStateGeneration != presentation.state.generation ||
+        m_transitionKind != transitionKind ||
+        m_transitionDurationMs != static_cast<int>(presentation.config.transition.duration_ms) ||
+        m_transitionAngle != presentation.config.transition.angle ||
+        m_transitionOrigin != QPointF(presentation.config.transition.origin_x,
+                                      presentation.config.transition.origin_y);
     m_pauseEffectKind              = kind;
     m_blurRadius                   = static_cast<int>(presentation.config.pause_effect.blur.radius);
     m_pauseEffectActive            = presentation.state.pause_effect.active;
     m_presentationConfigGeneration = presentation.config.generation;
     m_presentationStateGeneration  = presentation.state.generation;
+    {
+        QMutexLocker lock(&m_pendingMutex);
+        m_transitionKind       = transitionKind;
+        m_transitionDurationMs = static_cast<int>(presentation.config.transition.duration_ms);
+        m_transitionAngle      = presentation.config.transition.angle;
+        m_transitionOrigin     = QPointF(presentation.config.transition.origin_x,
+                                         presentation.config.transition.origin_y);
+        if (m_activeTransitionSerial != 0 && ! m_transitionActive &&
+            transitionKind != NoTransition) {
+            m_activeTransitionKind       = transitionKind;
+            m_activeTransitionDurationMs = m_transitionDurationMs;
+            m_activeTransitionAngle      = m_transitionAngle;
+            m_activeTransitionOrigin     = m_transitionOrigin;
+        }
+    }
     qCInfo(lcWD,
            "presentation snapshot: config=%llu state=%llu pause-effect kind=%d active=%d "
-           "radius=%d",
+           "radius=%d transition=%d duration=%d angle=%u origin=(%.3f,%.3f)",
            m_presentationConfigGeneration,
            m_presentationStateGeneration,
            int(m_pauseEffectKind),
            m_pauseEffectActive,
-           m_blurRadius);
+           m_blurRadius,
+           int(m_transitionKind),
+           m_transitionDurationMs,
+           m_transitionAngle,
+           m_transitionOrigin.x(),
+           m_transitionOrigin.y());
+    if (m_transitionKind == NoTransition) cancelTransition(true);
     if (changed) emit presentationChanged();
 }
 
@@ -711,48 +1136,20 @@ void WaywallenDisplay::applyPresentationState(const waywallen_presentation_state
 }
 
 void WaywallenDisplay::resetPresentation() {
-    const bool changed             = m_pauseEffectKind != NonePauseEffect || m_pauseEffectActive ||
-                                     m_blurRadius != 30 || m_presentationConfigGeneration != 0 ||
-                                     m_presentationStateGeneration != 0;
-    m_pauseEffectKind              = NonePauseEffect;
-    m_blurRadius                   = 30;
-    m_pauseEffectActive            = false;
+    const bool changed  = m_pauseEffectKind != NonePauseEffect || m_pauseEffectActive ||
+                          m_blurRadius != 30 || m_presentationConfigGeneration != 0 ||
+                          m_presentationStateGeneration != 0 || m_transitionKind != NoTransition;
+    m_pauseEffectKind   = NonePauseEffect;
+    m_blurRadius        = 30;
+    m_pauseEffectActive = false;
     m_presentationConfigGeneration = 0;
     m_presentationStateGeneration  = 0;
+    m_transitionKind               = NoTransition;
+    m_transitionDurationMs         = 400;
+    m_transitionAngle              = 0;
+    m_transitionOrigin             = QPointF(0.5, 0.5);
+    cancelTransition(false);
     if (changed) emit presentationChanged();
-}
-
-void WaywallenDisplay::commitPresentedContent(uint64_t generation, int width, int height,
-                                              uint32_t fourcc, const ConfigSnapshot& config) {
-    PresentationState::CommitResult result = PresentationState::CommitResult::Rejected;
-    qulonglong                      serial = 0;
-    {
-        QMutexLocker    lk(&m_pendingMutex);
-        ContentSnapshot content;
-        content.valid            = true;
-        content.bufferGeneration = generation;
-        content.width            = width;
-        content.height           = height;
-        content.fourcc           = fourcc;
-        content.config           = config;
-        result                   = m_presentationState.commit(content);
-        if (result == PresentationState::CommitResult::SourceChanged) {
-            serial = ++m_presentationSerial;
-        }
-    }
-    if (result == PresentationState::CommitResult::Rejected) {
-        qCWarning(lcWD, "presentation commit rejected for generation=%llu", qulonglong(generation));
-        return;
-    }
-    if (result == PresentationState::CommitResult::SameSourceUpdated) return;
-
-    QPointer<WaywallenDisplay> guard(this);
-    QMetaObject::invokeMethod(
-        this,
-        [guard, serial, clearColor = config.clearColor]() {
-            if (guard) guard->publishPresentationCommit(serial, clearColor);
-        },
-        Qt::QueuedConnection);
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,6 +1641,11 @@ void WaywallenDisplay::onWindowReady() {
             this,
             &WaywallenDisplay::onScreenChanged,
             Qt::UniqueConnection);
+    connect(window(),
+            &QQuickWindow::afterFrameEnd,
+            this,
+            &WaywallenDisplay::onAfterFrameEnd,
+            Qt::UniqueConnection);
     onScreenChanged(window()->screen());
 
     if (m_mouseForwardEnabled) {
@@ -1296,8 +1698,25 @@ void WaywallenDisplay::onWindowReady() {
             {
                 QMutexLocker lk(&m_pendingMutex);
                 m_presentationState.reset();
-                m_preparedEglContent         = ContentSnapshot {};
-                m_notifiedPresentationSerial = m_presentationSerial;
+                m_preparedEglContent = ContentSnapshot {};
+#ifdef WW_HAVE_VULKAN
+                m_preparedVkContent = ContentSnapshot {};
+#endif
+                m_candidatePrepareSerial        = 0;
+                m_promotionSerial               = 0;
+                m_frameSubmissionSerial         = 0;
+                m_promotionUsesTransition       = false;
+                m_frameSubmissionUsesTransition = false;
+                m_transitionActive              = false;
+                m_activeTransitionSerial        = 0;
+                m_transitionProgress            = 1.0;
+                m_outgoingContent               = ContentSnapshot {};
+                m_renderFrameSerial             = 0;
+                m_presentedLastFrameSerial      = 0;
+                m_presentedLastFrameSlot        = -1;
+                m_transitionLastFrameSerial     = 0;
+                m_transitionLastFrameSlot       = -1;
+                m_retirementPumpBudget          = 0;
             }
             m_textureCount  = 0;
             m_activeBackend = BackendNone;
@@ -1733,7 +2152,8 @@ void WaywallenDisplay::ensureGlTextures() {
 }
 
 WaywallenDisplay::EglBlitResult WaywallenDisplay::blitEglShadow(int slot, int width, int height,
-                                                                bool forceReplace) {
+                                                                bool forceReplace,
+                                                                bool reuseCandidate) {
     auto resourcesOwner = renderSessionResources();
     if (! resourcesOwner || slot < 0 || slot >= m_glTextures.size()) {
         return EglBlitResult::Failed;
@@ -1748,9 +2168,14 @@ WaywallenDisplay::EglBlitResult WaywallenDisplay::blitEglShadow(int slot, int wi
     const int h = height;
     if (w <= 0 || h <= 0) return EglBlitResult::Failed;
 
-    const bool replace = forceReplace || resources.eglShadowTex == 0 ||
-                         resources.eglShadowFbo == 0 || resources.eglShadowW != w ||
-                         resources.eglShadowH != h;
+    const bool updateCandidate = reuseCandidate && resources.eglCandidate.texture != 0 &&
+                                 resources.eglCandidate.framebuffer != 0 &&
+                                 resources.eglCandidate.width == w &&
+                                 resources.eglCandidate.height == h;
+    const bool replace =
+        ! updateCandidate && (forceReplace || resources.eglCurrent.texture == 0 ||
+                              resources.eglCurrent.framebuffer == 0 ||
+                              resources.eglCurrent.width != w || resources.eglCurrent.height != h);
     if (replace && ! resources.discardEglCandidate()) {
         qCWarning(lcWD, "EGL: cannot discard previous shadow candidate without a GL context");
         return EglBlitResult::Failed;
@@ -1764,8 +2189,12 @@ WaywallenDisplay::EglBlitResult WaywallenDisplay::blitEglShadow(int slot, int wi
     GLboolean prevScissor = gl->glIsEnabled(GL_SCISSOR_TEST);
     if (prevScissor) gl->glDisable(GL_SCISSOR_TEST);
 
-    uint targetTex = replace ? 0 : resources.eglShadowTex;
-    uint targetFbo = replace ? 0 : resources.eglShadowFbo;
+    uint targetTex = replace           ? 0
+                     : updateCandidate ? resources.eglCandidate.texture
+                                       : resources.eglCurrent.texture;
+    uint targetFbo = replace           ? 0
+                     : updateCandidate ? resources.eglCandidate.framebuffer
+                                       : resources.eglCurrent.framebuffer;
     if (replace) {
         gl->glGenTextures(1, &targetTex);
         gl->glGenFramebuffers(1, &targetFbo);
@@ -1821,25 +2250,29 @@ WaywallenDisplay::EglBlitResult WaywallenDisplay::blitEglShadow(int slot, int wi
         return complete ? EglBlitResult::FailedAfterGpuWork : EglBlitResult::Failed;
     }
 
-    if (replace) {
-        resources.eglCandidateFbo        = targetFbo;
-        resources.eglCandidateTex        = targetTex;
-        resources.eglCandidateW          = w;
-        resources.eglCandidateH          = h;
-        resources.eglCandidateHasContent = true;
-        const qulonglong candidateBytes  = qulonglong(w) * qulonglong(h) * 4ull;
+    if (replace || updateCandidate) {
+        if (replace) {
+            resources.eglCandidate.texture     = targetTex;
+            resources.eglCandidate.framebuffer = targetFbo;
+            resources.eglCandidate.width       = w;
+            resources.eglCandidate.height      = h;
+        }
+        resources.eglCandidate.hasContent = true;
+        const qulonglong candidateBytes   = qulonglong(w) * qulonglong(h) * 4ull;
         const qulonglong currentBytes =
-            qulonglong(resources.eglShadowW) * qulonglong(resources.eglShadowH) * 4ull;
-        qCInfo(lcWD,
-               "EGL shadow candidate: display=%llu %dx%d bytes=%llu resident=%llu",
-               m_displayId,
-               w,
-               h,
-               candidateBytes,
-               currentBytes + candidateBytes);
+            qulonglong(resources.eglCurrent.width) * qulonglong(resources.eglCurrent.height) * 4ull;
+        if (replace) {
+            qCInfo(lcWD,
+                   "EGL shadow candidate: display=%llu %dx%d bytes=%llu resident=%llu",
+                   m_displayId,
+                   w,
+                   h,
+                   candidateBytes,
+                   currentBytes + candidateBytes);
+        }
         return EglBlitResult::CandidateReady;
     }
-    resources.eglShadowHasContent = true;
+    resources.eglCurrent.hasContent = true;
     return EglBlitResult::CurrentUpdated;
 }
 
@@ -1852,13 +2285,16 @@ void WaywallenDisplay::renderThreadBlitEgl() {
     PendingEglFrame frame;
     ContentSnapshot incoming;
     bool            replacesPresentation = false;
+    bool            reuseCandidate       = false;
     {
         QMutexLocker lk(&m_pendingMutex);
         if (! m_pendingEgl.valid) return;
         frame        = m_pendingEgl;
         m_pendingEgl = PendingEglFrame {};
         (void)m_presentationState.incomingFor(frame.bufferGeneration, incoming);
-        replacesPresentation = m_presentationState.sourceChangesWith(frame.bufferGeneration);
+        replacesPresentation = m_presentationState.bufferChangesWith(frame.bufferGeneration);
+        reuseCandidate       = replacesPresentation && m_preparedEglContent.valid &&
+                               m_preparedEglContent.bufferGeneration == frame.bufferGeneration;
     }
     if (! incoming.valid || m_activeBackend != BackendEGL || ! m_eglImagesValid) {
         releaseEglFrame(frame.releaseSyncobjFd, false, frame.bufferGeneration, frame.seq);
@@ -1871,14 +2307,9 @@ void WaywallenDisplay::renderThreadBlitEgl() {
         releaseEglFrame(frame.releaseSyncobjFd, false, frame.bufferGeneration, frame.seq);
         return;
     }
-    const EglBlitResult result =
-        blitEglShadow(frame.slot, incoming.width, incoming.height, replacesPresentation);
+    const EglBlitResult result = blitEglShadow(
+        frame.slot, incoming.width, incoming.height, replacesPresentation, reuseCandidate);
     if (result == EglBlitResult::CurrentUpdated) {
-        commitPresentedContent(frame.bufferGeneration,
-                               incoming.width,
-                               incoming.height,
-                               incoming.fourcc,
-                               incoming.config);
         releaseEglFrame(frame.releaseSyncobjFd, true, frame.bufferGeneration, frame.seq);
     } else if (result == EglBlitResult::CandidateReady) {
         {
@@ -1898,8 +2329,16 @@ void WaywallenDisplay::renderThreadBlitEgl() {
 // ---------------------------------------------------------------------------
 
 QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
-    auto  resourcesOwner = renderSessionResources();
-    auto* resources      = resourcesOwner.get();
+    auto             resourcesOwner = renderSessionResources();
+    auto*            resources      = resourcesOwner.get();
+    const qulonglong frameSerial    = ++m_renderFrameSerial;
+    int              frameSlot      = -1;
+    int              framesInFlight = 1;
+    if (window()) {
+        const auto graphicsState = window()->graphicsStateInfo();
+        frameSlot                = graphicsState.currentFrameSlot;
+        framesInFlight           = qMax(1, graphicsState.framesInFlight);
+    }
     // Run library-deferred pool destructions on the render thread,
     // where (a) Qt's GL context is current for glDeleteTextures (EGL
     // path) and (b) we can guarantee no in-flight vkQueueSubmit on
@@ -1925,11 +2364,60 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
 #endif
     }
 
-    auto* rootNode = dynamic_cast<PresentationNode*>(oldNode);
-    if (! rootNode && oldNode) {
+    auto* rootNode       = dynamic_cast<PresentationNode*>(oldNode);
+    auto* transitionNode = dynamic_cast<TransitionNode*>(oldNode);
+    if (! rootNode && ! transitionNode && oldNode) {
         delete oldNode;
         oldNode = nullptr;
     }
+
+    ContentSnapshot outgoingContent;
+    qulonglong      transitionSerial      = 0;
+    bool            renderTransition      = false;
+    qreal           transitionProgress    = 1.0;
+    TransitionKind  activeTransitionKind  = NoTransition;
+    quint32         activeTransitionAngle = 0;
+    QPointF         activeTransitionOrigin;
+    {
+        QMutexLocker lock(&m_pendingMutex);
+        renderTransition = m_activeTransitionSerial != 0 && m_outgoingContent.valid &&
+                           (m_transitionActive || m_frameSubmissionUsesTransition);
+        if (renderTransition) {
+            outgoingContent        = m_outgoingContent;
+            transitionSerial       = m_activeTransitionSerial;
+            transitionProgress     = m_transitionProgress;
+            activeTransitionKind   = m_activeTransitionKind;
+            activeTransitionAngle  = m_activeTransitionAngle;
+            activeTransitionOrigin = m_activeTransitionOrigin;
+        }
+    }
+
+    if (transitionNode && (! renderTransition || transitionNode->serial() != transitionSerial)) {
+        delete transitionNode;
+        transitionNode = nullptr;
+        oldNode        = nullptr;
+        if (resources && resources->hasOutgoing()) {
+            resources->retireOutgoing({ m_transitionLastFrameSlot, m_transitionLastFrameSerial });
+            m_retirementPumpBudget = qMax(m_retirementPumpBudget, framesInFlight);
+        }
+        QMutexLocker lock(&m_pendingMutex);
+        m_outgoingContent = ContentSnapshot {};
+    }
+
+    bool retirementPending = resources && resources->collectRetired(frameSlot, frameSerial);
+    if (retirementPending && m_retirementPumpBudget > 0) {
+        --m_retirementPumpBudget;
+        QPointer<WaywallenDisplay> guard(this);
+        QMetaObject::invokeMethod(
+            this,
+            [guard]() {
+                if (guard) guard->update();
+            },
+            Qt::QueuedConnection);
+    } else if (! retirementPending) {
+        m_retirementPumpBudget = 0;
+    }
+
     auto ensureRootNode = [&]() -> PresentationNode* {
         if (rootNode) return rootNode;
         if (! window()) return nullptr;
@@ -1955,22 +2443,23 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
             if (m_presentationState.incomingFor(m_preparedEglContent.bufferGeneration, latest)) {
                 eglCandidateContent = latest;
             }
-            m_preparedEglContent = ContentSnapshot {};
         }
     }
 
 #ifdef WW_HAVE_VULKAN
     PendingVkFrame  frame;
     ContentSnapshot incoming;
-    ContentSnapshot vkCandidateContent;
     bool            replacesPresentation = false;
+    bool            reuseCandidate       = false;
     {
         QMutexLocker lk(&m_pendingMutex);
         frame       = m_pendingVk;
         m_pendingVk = PendingVkFrame {};
         if (frame.valid) {
             (void)m_presentationState.incomingFor(frame.bufferGeneration, incoming);
-            replacesPresentation = m_presentationState.sourceChangesWith(frame.bufferGeneration);
+            replacesPresentation = m_presentationState.bufferChangesWith(frame.bufferGeneration);
+            reuseCandidate       = replacesPresentation && m_preparedVkContent.valid &&
+                                   m_preparedVkContent.bufferGeneration == frame.bufferGeneration;
         }
     }
 
@@ -2023,35 +2512,38 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
             auto      acquireSem     = reinterpret_cast<VkSemaphore>(frame.acquireSem);
             bool      candidateReady = false;
             bool      releaseArmed   = false;
-            const int rc             = ww_vk_blitter_prepare(&resources->vkBlitter,
-                                                             imported,
-                                                             static_cast<uint32_t>(incoming.width),
-                                                             static_cast<uint32_t>(incoming.height),
-                                                             incoming.fourcc,
-                                                             replacesPresentation,
-                                                             acquireSem,
-                                                             frame.releaseSyncobjFd,
-                                                             &candidateReady,
-                                                             &releaseArmed);
+            const int rc =
+                ww_vk_blitter_prepare_reusing_candidate(&resources->vkBlitter,
+                                                        imported,
+                                                        static_cast<uint32_t>(incoming.width),
+                                                        static_cast<uint32_t>(incoming.height),
+                                                        incoming.fourcc,
+                                                        replacesPresentation,
+                                                        reuseCandidate,
+                                                        acquireSem,
+                                                        frame.releaseSyncobjFd,
+                                                        &candidateReady,
+                                                        &releaseArmed);
             if (releaseArmed) reportFrameArmed(frame.bufferGeneration, frame.seq);
             if (rc == 0) {
                 if (candidateReady) {
-                    vkCandidateContent = incoming;
-                    qCInfo(
-                        lcWD,
-                        "Vulkan shadow candidate: display=%llu %dx%d bytes=%llu resident=%llu",
-                        m_displayId,
-                        incoming.width,
-                        incoming.height,
-                        qulonglong(ww_vk_blitter_candidate_allocation_size(&resources->vkBlitter)),
-                        qulonglong(ww_vk_blitter_shadow_allocation_size(&resources->vkBlitter) +
+                    {
+                        QMutexLocker lock(&m_pendingMutex);
+                        m_preparedVkContent = incoming;
+                    }
+                    if (! reuseCandidate) {
+                        qCInfo(lcWD,
+                               "Vulkan shadow candidate: display=%llu %dx%d bytes=%llu "
+                               "resident=%llu",
+                               m_displayId,
+                               incoming.width,
+                               incoming.height,
+                               qulonglong(
+                                   ww_vk_blitter_candidate_allocation_size(&resources->vkBlitter)),
+                               qulonglong(
+                                   ww_vk_blitter_shadow_allocation_size(&resources->vkBlitter) +
                                    ww_vk_blitter_candidate_allocation_size(&resources->vkBlitter)));
-                } else {
-                    commitPresentedContent(frame.bufferGeneration,
-                                           incoming.width,
-                                           incoming.height,
-                                           incoming.fourcc,
-                                           incoming.config);
+                    }
                 }
             } else if (! releaseArmed) {
                 bool drainedRelease = false;
@@ -2067,103 +2559,225 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
     }
 #endif
 
-    if (resources && resources->eglCandidateTex != 0) {
-        const bool validCandidate = m_activeBackend == BackendEGL && eglCandidateContent.valid &&
-                                    resources->eglCandidateHasContent;
-        if (! validCandidate || ! window()) {
-            if (! resources->discardEglCandidate()) {
-                qCCritical(lcWD, "EGL shadow candidate could not be discarded");
-                scheduleSessionFailure(QStringLiteral("EGL shadow candidate cleanup failed"));
-            }
-        } else if (auto* candidateNode = ensureRootNode()) {
-            const QSize size(eglCandidateContent.width, eglCandidateContent.height);
-            QSGTexture* wrapper = QNativeInterface::QSGOpenGLTexture::fromNative(
-                resources->eglCandidateTex, window(), size, QQuickWindow::TextureHasAlphaChannel);
-            if (! wrapper) {
-                qCWarning(lcWD, "EGL candidate native texture wrapper creation failed");
-                (void)resources->discardEglCandidate();
-            } else {
-                candidateNode->installTexture(wrapper,
-                                              PresentationNode::TextureBackend::OpenGL,
-                                              static_cast<quintptr>(resources->eglCandidateTex),
-                                              size);
-                if (! resources->commitEglCandidate()) {
-                    qCCritical(lcWD, "EGL candidate commit failed after wrapper replacement");
-                    delete rootNode;
-                    rootNode = nullptr;
-                    oldNode  = nullptr;
-                    scheduleSessionFailure(QStringLiteral("EGL shadow commit failed"));
-                } else {
-                    qCInfo(lcWD,
-                           "EGL shadow committed: display=%llu resident=%llu",
-                           m_displayId,
-                           qulonglong(resources->eglShadowW) * qulonglong(resources->eglShadowH) *
-                               4ull);
-                    commitPresentedContent(eglCandidateContent.bufferGeneration,
-                                           eglCandidateContent.width,
-                                           eglCandidateContent.height,
-                                           eglCandidateContent.fourcc,
-                                           eglCandidateContent.config);
-                }
-            }
-        } else {
-            (void)resources->discardEglCandidate();
-        }
-    }
-
 #ifdef WW_HAVE_VULKAN
-    if (resources && vkCandidateContent.valid && resources->vkBlitterInited &&
-        ww_vk_blitter_candidate_has_content(&resources->vkBlitter)) {
-        if (! window()) {
-            (void)ww_vk_blitter_discard_candidate(&resources->vkBlitter);
-        } else if (auto* candidateNode = ensureRootNode()) {
-            const QSize size(vkCandidateContent.width, vkCandidateContent.height);
-            const auto  image   = ww_vk_blitter_candidate(&resources->vkBlitter);
-            QSGTexture* wrapper = QNativeInterface::QSGVulkanTexture::fromNative(
-                image,
-                ww_vk_blitter_shadow_layout(&resources->vkBlitter),
-                window(),
-                size,
-                QQuickWindow::TextureHasAlphaChannel);
-            if (! wrapper) {
-                qCWarning(lcWD, "Vulkan candidate native texture wrapper creation failed");
-                (void)ww_vk_blitter_discard_candidate(&resources->vkBlitter);
-            } else {
-                candidateNode->installTexture(wrapper,
-                                              PresentationNode::TextureBackend::Vulkan,
-                                              reinterpret_cast<quintptr>(image),
-                                              size);
-                const VkResult result = ww_vk_blitter_commit_candidate(&resources->vkBlitter);
-                if (result != VK_SUCCESS) {
-                    qCCritical(lcWD,
-                               "Vulkan candidate commit failed after wrapper replacement: %d",
-                               int(result));
-                    delete rootNode;
-                    rootNode = nullptr;
-                    oldNode  = nullptr;
-                    scheduleSessionFailure(QStringLiteral("Vulkan shadow commit failed"));
-                } else {
-                    qCInfo(lcWD,
-                           "Vulkan shadow committed: display=%llu resident=%llu",
-                           m_displayId,
-                           qulonglong(ww_vk_blitter_shadow_allocation_size(&resources->vkBlitter)));
-                    commitPresentedContent(vkCandidateContent.bufferGeneration,
-                                           vkCandidateContent.width,
-                                           vkCandidateContent.height,
-                                           vkCandidateContent.fourcc,
-                                           vkCandidateContent.config);
-                }
+    ContentSnapshot vkCandidateContent;
+    {
+        QMutexLocker lock(&m_pendingMutex);
+        if (m_preparedVkContent.valid) {
+            ContentSnapshot latest;
+            if (m_presentationState.incomingFor(m_preparedVkContent.bufferGeneration, latest)) {
+                vkCandidateContent = latest;
             }
-        } else {
-            (void)ww_vk_blitter_discard_candidate(&resources->vkBlitter);
         }
     }
 #endif
 
+    ContentSnapshot candidateContent;
+    bool            candidateAvailable = false;
+    if (resources && m_activeBackend == BackendEGL && resources->eglCandidate.texture != 0 &&
+        resources->eglCandidate.hasContent && eglCandidateContent.valid) {
+        candidateContent   = eglCandidateContent;
+        candidateAvailable = true;
+    }
+#ifdef WW_HAVE_VULKAN
+    if (resources && m_activeBackend == BackendVulkan && vkCandidateContent.valid &&
+        resources->vkBlitterInited && ww_vk_blitter_candidate_has_content(&resources->vkBlitter)) {
+        candidateContent   = vkCandidateContent;
+        candidateAvailable = true;
+    }
+#endif
+
+    if (! window()) candidateAvailable = false;
+
+    if (resources && resources->eglCandidate.texture != 0 &&
+        (! candidateAvailable || m_activeBackend != BackendEGL || ! window())) {
+        if (! resources->discardEglCandidate()) {
+            scheduleSessionFailure(QStringLiteral("EGL shadow candidate cleanup failed"));
+        }
+    }
+#ifdef WW_HAVE_VULKAN
+    if (resources && resources->vkBlitterInited &&
+        ww_vk_blitter_candidate(&resources->vkBlitter) != VK_NULL_HANDLE &&
+        (! candidateAvailable || m_activeBackend != BackendVulkan || ! window())) {
+        if (ww_vk_blitter_discard_candidate(&resources->vkBlitter) != 0) {
+            scheduleSessionFailure(QStringLiteral("Vulkan shadow candidate cleanup failed"));
+        }
+    }
+#endif
+
+    if (candidateAvailable) {
+        QMutexLocker    lock(&m_pendingMutex);
+        ContentSnapshot prepared;
+        bool            preparedTransition = false;
+        if (m_candidatePrepareSerial != 0 &&
+            ! m_presentationState.prepared(
+                m_candidatePrepareSerial, prepared, preparedTransition)) {
+            m_candidatePrepareSerial = 0;
+            m_promotionSerial        = 0;
+        }
+        const bool transitionBusy = m_transitionActive || m_activeTransitionSerial != 0 ||
+                                    m_frameSubmissionUsesTransition ||
+                                    m_presentationState.transitionActive();
+        if (m_candidatePrepareSerial == 0 && ! transitionBusy) {
+            std::uint64_t serial = 0;
+            const auto result = m_presentationState.prepare(candidateContent,
+                                                            transitionConfigured(),
+                                                            m_presentationState.displayed().valid,
+                                                            serial);
+            if (result == PresentationState::PrepareResult::Direct ||
+                result == PresentationState::PrepareResult::Transition ||
+                result == PresentationState::PrepareResult::AlreadyPrepared) {
+                m_candidatePrepareSerial = serial;
+                m_promotionSerial        = serial;
+                if (result == PresentationState::PrepareResult::AlreadyPrepared) {
+                    ContentSnapshot ignored;
+                    bool            transition = false;
+                    (void)m_presentationState.prepared(serial, ignored, transition);
+                    m_promotionUsesTransition = transition;
+                } else {
+                    m_promotionUsesTransition =
+                        result == PresentationState::PrepareResult::Transition;
+                }
+            } else if (result == PresentationState::PrepareResult::Rejected) {
+                qCWarning(lcWD,
+                          "candidate rejected for buffer=%llu token=%llu",
+                          qulonglong(candidateContent.bufferGeneration),
+                          qulonglong(candidateContent.contentToken));
+            }
+        }
+    }
+
+    qulonglong      promotionSerial     = 0;
+    bool            promotionTransition = false;
+    ContentSnapshot promotionOutgoing;
+    if (candidateAvailable) {
+        QMutexLocker lock(&m_pendingMutex);
+        if (m_promotionSerial != 0 && m_promotionSerial == m_candidatePrepareSerial) {
+            ContentSnapshot prepared;
+            bool            preparedTransition = false;
+            if (m_presentationState.prepared(m_promotionSerial, prepared, preparedTransition) &&
+                prepared.bufferGeneration == candidateContent.bufferGeneration) {
+                promotionSerial     = m_promotionSerial;
+                promotionTransition = m_promotionUsesTransition;
+                promotionOutgoing   = m_presentationState.displayed();
+            }
+        }
+    }
+
+    if (promotionSerial != 0) {
+        delete oldNode;
+        oldNode        = nullptr;
+        rootNode       = nullptr;
+        transitionNode = nullptr;
+
+        bool committed = false;
+        if (m_activeBackend == BackendEGL) {
+            committed = resources->commitEglCandidateRetaining();
+            if (committed) {
+                qCInfo(lcWD,
+                       "EGL shadow submitted: display=%llu resident=%llu",
+                       m_displayId,
+                       qulonglong(resources->eglCurrent.width) *
+                               qulonglong(resources->eglCurrent.height) * 4ull +
+                           qulonglong(resources->eglOutgoing.width) *
+                               qulonglong(resources->eglOutgoing.height) * 4ull);
+            }
+        }
+#ifdef WW_HAVE_VULKAN
+        else if (m_activeBackend == BackendVulkan) {
+            const VkResult result = ww_vk_blitter_commit_candidate_retaining(
+                &resources->vkBlitter, &resources->vkOutgoing);
+            committed = result == VK_SUCCESS;
+            if (! committed) {
+                qCCritical(lcWD, "Vulkan shadow submit failed: %d", int(result));
+            } else {
+                qCInfo(lcWD,
+                       "Vulkan shadow submitted: display=%llu resident=%llu",
+                       m_displayId,
+                       qulonglong(ww_vk_blitter_shadow_allocation_size(&resources->vkBlitter) +
+                                  resources->vkOutgoing.allocation_size));
+            }
+        }
+#endif
+        if (! committed) {
+            {
+                QMutexLocker lock(&m_pendingMutex);
+                (void)m_presentationState.discard(promotionSerial);
+                m_candidatePrepareSerial  = 0;
+                m_promotionSerial         = 0;
+                m_promotionUsesTransition = false;
+                m_preparedEglContent      = ContentSnapshot {};
+#ifdef WW_HAVE_VULKAN
+                m_preparedVkContent = ContentSnapshot {};
+#endif
+            }
+            bool discarded = true;
+            if (m_activeBackend == BackendEGL) {
+                discarded = resources->discardEglCandidate();
+            }
+#ifdef WW_HAVE_VULKAN
+            else if (m_activeBackend == BackendVulkan) {
+                discarded = ww_vk_blitter_discard_candidate(&resources->vkBlitter) == 0;
+            }
+#endif
+            qCWarning(lcWD, "shadow candidate promotion failed; keeping current content");
+            if (! discarded) {
+                scheduleSessionFailure(QStringLiteral("shadow candidate cleanup failed"));
+            }
+        } else {
+            bool promoted = false;
+            {
+                QMutexLocker lock(&m_pendingMutex);
+                promoted = m_presentationState.promote(promotionSerial);
+                if (promoted) {
+                    m_candidatePrepareSerial  = 0;
+                    m_promotionSerial         = 0;
+                    m_promotionUsesTransition = false;
+                    m_preparedEglContent      = ContentSnapshot {};
+#ifdef WW_HAVE_VULKAN
+                    m_preparedVkContent = ContentSnapshot {};
+#endif
+                    if (promotionTransition) {
+                        m_outgoingContent            = promotionOutgoing;
+                        m_activeTransitionSerial     = promotionSerial;
+                        m_transitionActive           = false;
+                        m_transitionProgress         = 0.0;
+                        m_activeTransitionKind       = m_transitionKind;
+                        m_activeTransitionDurationMs = m_transitionDurationMs;
+                        m_activeTransitionAngle      = m_transitionAngle;
+                        m_activeTransitionOrigin     = m_transitionOrigin;
+                        m_presentationState.setTransitionActive(true);
+                    } else {
+                        m_outgoingContent = ContentSnapshot {};
+                    }
+                }
+            }
+            if (! promoted) {
+                scheduleSessionFailure(QStringLiteral("shadow candidate state was superseded"));
+            } else {
+                if (promotionTransition) {
+                    renderTransition       = true;
+                    outgoingContent        = promotionOutgoing;
+                    transitionSerial       = promotionSerial;
+                    transitionProgress     = 0.0;
+                    activeTransitionKind   = m_activeTransitionKind;
+                    activeTransitionAngle  = m_activeTransitionAngle;
+                    activeTransitionOrigin = m_activeTransitionOrigin;
+                }
+                if (! promotionTransition && resources->hasOutgoing()) {
+                    resources->retireOutgoing(
+                        { m_presentedLastFrameSlot, m_presentedLastFrameSerial });
+                    m_retirementPumpBudget = qMax(m_retirementPumpBudget, framesInFlight);
+                }
+                armPresentationSubmission(promotionSerial, promotionTransition);
+            }
+        }
+    }
+
     ContentSnapshot presented;
     {
         QMutexLocker lk(&m_pendingMutex);
-        presented = m_presentationState.presented();
+        presented = m_presentationState.displayed();
     }
 
     const bool hasTexture =
@@ -2174,7 +2788,7 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
         // the same "keep last frame on switch" continuity the Vulkan
         // path has.
         (resources && presented.valid && m_activeBackend == BackendEGL &&
-         resources->eglShadowTex != 0 && resources->eglShadowHasContent)
+         resources->eglCurrent.texture != 0 && resources->eglCurrent.hasContent)
 #ifdef WW_HAVE_VULKAN
         // Gate Vulkan sampling on a shadow populated by a completed copy.
         || (resources && presented.valid && m_activeBackend == BackendVulkan &&
@@ -2185,8 +2799,95 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
         ;
 
     if (! hasTexture || ! window()) {
-        delete rootNode;
+        delete oldNode;
         return nullptr;
+    }
+
+    auto createCurrentTexture = [&]() -> QSGTexture* {
+        const QSize textureSize(presented.width, presented.height);
+        if (m_activeBackend == BackendEGL) {
+            return QNativeInterface::QSGOpenGLTexture::fromNative(
+                resources->eglCurrent.texture,
+                window(),
+                textureSize,
+                QQuickWindow::TextureHasAlphaChannel);
+        }
+#ifdef WW_HAVE_VULKAN
+        if (m_activeBackend == BackendVulkan) {
+            return QNativeInterface::QSGVulkanTexture::fromNative(
+                ww_vk_blitter_shadow(&resources->vkBlitter),
+                ww_vk_blitter_shadow_layout(&resources->vkBlitter),
+                window(),
+                textureSize,
+                QQuickWindow::TextureHasAlphaChannel);
+        }
+#endif
+        return nullptr;
+    };
+
+    auto createOutgoingTexture = [&]() -> QSGTexture* {
+        const QSize textureSize(outgoingContent.width, outgoingContent.height);
+        if (! resources || ! resources->hasOutgoing()) return nullptr;
+        if (m_activeBackend == BackendEGL) {
+            return QNativeInterface::QSGOpenGLTexture::fromNative(
+                resources->eglOutgoing.texture,
+                window(),
+                textureSize,
+                QQuickWindow::TextureHasAlphaChannel);
+        }
+#ifdef WW_HAVE_VULKAN
+        if (m_activeBackend == BackendVulkan) {
+            return QNativeInterface::QSGVulkanTexture::fromNative(
+                resources->vkOutgoing.image,
+                resources->vkOutgoing.layout,
+                window(),
+                textureSize,
+                QQuickWindow::TextureHasAlphaChannel);
+        }
+#endif
+        return nullptr;
+    };
+
+    const QRectF bounds = boundingRect();
+    if (renderTransition) {
+        if (! transitionNode || transitionNode->serial() != transitionSerial) {
+            delete oldNode;
+            oldNode        = nullptr;
+            rootNode       = nullptr;
+            transitionNode = TransitionNode::create(
+                window(), transitionSerial, createOutgoingTexture(), createCurrentTexture());
+            oldNode = transitionNode;
+        }
+        if (transitionNode) {
+            transitionNode->updateScene(activeTransitionKind,
+                                        transitionProgress,
+                                        activeTransitionAngle,
+                                        activeTransitionOrigin,
+                                        bounds,
+                                        outgoingContent,
+                                        presented,
+                                        m_displayWidth,
+                                        m_displayHeight);
+            m_presentedLastFrameSlot    = frameSlot;
+            m_presentedLastFrameSerial  = frameSerial;
+            m_transitionLastFrameSlot   = frameSlot;
+            m_transitionLastFrameSerial = frameSerial;
+            return transitionNode;
+        }
+
+        qCWarning(lcWD, "transition scene creation failed; presenting content directly");
+        QMutexLocker lock(&m_pendingMutex);
+        m_transitionActive = false;
+        m_presentationState.setTransitionActive(false);
+        m_activeTransitionSerial        = 0;
+        m_transitionProgress            = 1.0;
+        m_frameSubmissionUsesTransition = false;
+        m_outgoingContent               = ContentSnapshot {};
+        lock.unlock();
+        if (resources && resources->hasOutgoing()) {
+            resources->retireOutgoing({ m_presentedLastFrameSlot, m_presentedLastFrameSerial });
+            m_retirementPumpBudget = qMax(m_retirementPumpBudget, framesInFlight);
+        }
     }
 
     rootNode = ensureRootNode();
@@ -2195,17 +2896,19 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
     auto* xformNode = rootNode->transformNode;
     auto* node      = rootNode->imageNode;
 
-    const QRectF bounds = boundingRect();
     clearNode->setRect(bounds);
     clearNode->setColor(presented.config.clearColor);
 
     const QSize texSize(presented.width, presented.height);
 
     if (m_activeBackend == BackendEGL) {
-        const auto handle = static_cast<quintptr>(resources->eglShadowTex);
+        const auto handle = static_cast<quintptr>(resources->eglCurrent.texture);
         if (! rootNode->wraps(PresentationNode::TextureBackend::OpenGL, handle, texSize)) {
             QSGTexture* wrapper = QNativeInterface::QSGOpenGLTexture::fromNative(
-                resources->eglShadowTex, window(), texSize, QQuickWindow::TextureHasAlphaChannel);
+                resources->eglCurrent.texture,
+                window(),
+                texSize,
+                QQuickWindow::TextureHasAlphaChannel);
             if (! wrapper) {
                 delete rootNode;
                 return nullptr;
@@ -2275,5 +2978,7 @@ QSGNode* WaywallenDisplay::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
         xformNode->markDirty(QSGNode::DirtyMatrix);
     }
 
+    m_presentedLastFrameSlot   = frameSlot;
+    m_presentedLastFrameSerial = frameSerial;
     return rootNode;
 }

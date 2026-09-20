@@ -33,6 +33,9 @@ Item {
         displayWidth: root.width
         displayHeight: root.height
         presentationCapabilities: WW.WaywallenDisplay.PauseBlurCapability
+                                  | WW.WaywallenDisplay.FadeTransitionCapability
+                                  | WW.WaywallenDisplay.WipeTransitionCapability
+                                  | WW.WaywallenDisplay.GrowTransitionCapability
     }
 
     Loader {
