@@ -230,23 +230,23 @@ void TransitionNode::updateClip(WaywallenDisplay::TransitionKind kind, qreal pro
     for (const auto& corner : corners) reach = qMax(reach, QLineF(center, corner).length());
     constexpr qreal pi     = 3.14159265358979323846;
     const qreal     radius = reach * progress / std::cos(pi / segmentCount);
-    auto*           points = m_clipGeometry->vertexDataAsPoint2D();
+    m_clipGeometry->allocate(segmentCount + 2);
+    auto* points = m_clipGeometry->vertexDataAsPoint2D();
     points[0].set(static_cast<float>(center.x()), static_cast<float>(center.y()));
     for (int index = 0; index <= segmentCount; ++index) {
         const qreal radians = 2.0 * pi * qreal(index) / qreal(segmentCount);
         points[index + 1].set(static_cast<float>(center.x() + radius * std::cos(radians)),
                               static_cast<float>(center.y() + radius * std::sin(radians)));
     }
-    m_clipGeometry->setVertexCount(segmentCount + 2);
     m_clipNode->markDirty(QSGNode::DirtyGeometry);
 }
 
 void TransitionNode::setClipPolygon(const QVector<QPointF>& polygon) {
+    m_clipGeometry->allocate(polygon.size());
     auto* points = m_clipGeometry->vertexDataAsPoint2D();
     for (int index = 0; index < polygon.size(); ++index) {
         points[index].set(static_cast<float>(polygon[index].x()),
                           static_cast<float>(polygon[index].y()));
     }
-    m_clipGeometry->setVertexCount(polygon.size());
     m_clipNode->markDirty(QSGNode::DirtyGeometry);
 }
