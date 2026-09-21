@@ -23,6 +23,9 @@ const DAEMON_BUS_NAME  = 'org.waywallen.waywallen.Daemon';
 const DAEMON_OBJ_PATH  = '/org/waywallen/waywallen/Daemon';
 const DAEMON_IFACE     = 'org.waywallen.waywallen.Daemon1';
 const DAEMON_READY_SIG = 'Ready';
+const RESPAWN_INITIAL_DELAY_MS = 2000;
+const RESPAWN_MAX_DELAY_MS     = 30000;
+const RESPAWN_STABLE_TIME_US   = 20 * 1000 * 1000;
 
 function generateUuidV4() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -38,7 +41,7 @@ export default class WaywallenExtension extends Extension {
         this._isEnabled = false;
         this._currentProc = null;
         this._respawnId = 0;
-        this._respawnDelayMs = 100;
+        this._respawnDelayMs = RESPAWN_INITIAL_DELAY_MS;
         // Bus state — set by the bus watcher; reset on disable.
         this._daemonUp = false;
         this._busWatchId = 0;
@@ -106,7 +109,7 @@ export default class WaywallenExtension extends Extension {
         log('[waywallen] daemon appeared on session bus');
         this._daemonUp = true;
         this._override?.setRendererAvailable(false);
-        this._respawnDelayMs = 100;
+        this._respawnDelayMs = RESPAWN_INITIAL_DELAY_MS;
         if (this._isEnabled && !this._currentProc)
             this._spawnRenderer();
     }
@@ -131,12 +134,18 @@ export default class WaywallenExtension extends Extension {
     _onDaemonReady() {
         log('[waywallen] daemon Ready signal');
         this._daemonUp = true;
-        if (this._isEnabled && !this._currentProc)
+        if (this._isEnabled && !this._currentProc) {
+            if (this._respawnId) {
+                GLib.source_remove(this._respawnId);
+                this._respawnId = 0;
+            }
+            this._respawnDelayMs = RESPAWN_INITIAL_DELAY_MS;
             this._spawnRenderer();
+        }
     }
 
     _spawnRenderer() {
-        if (!this._daemonUp)
+        if (!this._daemonUp || this._currentProc)
             return;
 
         const rendererPath =
@@ -153,6 +162,7 @@ export default class WaywallenExtension extends Extension {
 
         this._currentProc = new LaunchSubprocess();
         const proc = this._currentProc;
+        const startedAtUs = GLib.get_monotonic_time();
         proc.setControlHandler(frame => {
             if (this._currentProc !== proc || !this._override)
                 return;
@@ -197,21 +207,22 @@ export default class WaywallenExtension extends Extension {
             this._override?.resetPresentation();
             if (!this._isEnabled || !this._daemonUp)
                 return;
-            // Daemon is up but renderer died: exponential backoff up to 30s.
-            const cleanExit = subprocess.get_if_exited()
-                && subprocess.get_exit_status() === 0;
-            this._respawnDelayMs = cleanExit
-                ? 100
-                : Math.min(this._respawnDelayMs * 2, 30000);
-            this._scheduleRespawn();
+            const livedUs = GLib.get_monotonic_time() - startedAtUs;
+            if (livedUs >= RESPAWN_STABLE_TIME_US)
+                this._respawnDelayMs = RESPAWN_INITIAL_DELAY_MS;
+            const delayMs = this._respawnDelayMs;
+            this._respawnDelayMs = Math.min(delayMs * 2, RESPAWN_MAX_DELAY_MS);
+            log(`[waywallen] renderer exited after ${Math.round(livedUs / 1000)} ms; ` +
+                `respawning in ${delayMs} ms`);
+            this._scheduleRespawn(delayMs);
         });
     }
 
-    _scheduleRespawn() {
+    _scheduleRespawn(delayMs) {
         if (this._respawnId)
             return;
         this._respawnId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
-            this._respawnDelayMs, () => {
+            delayMs, () => {
                 this._respawnId = 0;
                 if (this._isEnabled && this._daemonUp)
                     this._spawnRenderer();
