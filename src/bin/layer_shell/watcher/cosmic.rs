@@ -37,9 +37,8 @@ use wayland_client::backend::ObjectId;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
-use wayland_client::{
-    event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle,
-};
+use wayland_client::WEnum;
+use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
     ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
@@ -49,7 +48,6 @@ use wayland_protocols::ext::workspace::v1::client::{
     ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1},
     ext_workspace_manager_v1::{self, ExtWorkspaceManagerV1},
 };
-use wayland_client::WEnum;
 use waywallen_display::{
     WAYWALLEN_WIN_HAS_ACTIVE, WAYWALLEN_WIN_HAS_FULLSCREEN, WAYWALLEN_WIN_HAS_MAXIMIZED,
     WAYWALLEN_WIN_HAS_NON_MINIMIZED,
@@ -118,9 +116,10 @@ fn run_loop(commands: CommandSender) {
 }
 
 fn run_connected(commands: &CommandSender) -> Result<(), String> {
-    let connection = Connection::connect_to_env().map_err(|error| format!("connect to compositor: {error}"))?;
-    let (globals, queue) =
-        registry_queue_init::<Watcher>(&connection).map_err(|error| format!("registry init: {error}"))?;
+    let connection =
+        Connection::connect_to_env().map_err(|error| format!("connect to compositor: {error}"))?;
+    let (globals, queue) = registry_queue_init::<Watcher>(&connection)
+        .map_err(|error| format!("registry init: {error}"))?;
     let qh = queue.handle();
     let mut watcher = Watcher::new(commands.clone());
     let mut foreign_toplevel_list = None;
@@ -129,42 +128,31 @@ fn run_connected(commands: &CommandSender) -> Result<(), String> {
     for global in globals.contents().clone_list() {
         match global.interface.as_str() {
             FOREIGN_TOPLEVEL_LIST_INTERFACE => {
-                foreign_toplevel_list = Some(
-                    globals
-                        .registry()
-                        .bind::<ExtForeignToplevelListV1, _, _>(
-                            global.name,
-                            global.version.min(FOREIGN_TOPLEVEL_LIST_VERSION),
-                            &qh,
-                            (),
-                        ),
-                );
+                foreign_toplevel_list =
+                    Some(globals.registry().bind::<ExtForeignToplevelListV1, _, _>(
+                        global.name,
+                        global.version.min(FOREIGN_TOPLEVEL_LIST_VERSION),
+                        &qh,
+                        (),
+                    ));
             }
             TOPLEVEL_INFO_INTERFACE if global.version >= 2 => {
-                toplevel_info = Some(
-                    globals
-                        .registry()
-                        .bind::<ZcosmicToplevelInfoV1, _, _>(
-                            global.name,
-                            global.version.min(TOPLEVEL_INFO_VERSION),
-                            &qh,
-                            (),
-                        ),
-                );
+                toplevel_info = Some(globals.registry().bind::<ZcosmicToplevelInfoV1, _, _>(
+                    global.name,
+                    global.version.min(TOPLEVEL_INFO_VERSION),
+                    &qh,
+                    (),
+                ));
             }
             WORKSPACE_MANAGER_INTERFACE => {
                 // Optional: without it every toplevel counts as visible,
                 // which degrades to the wlr fallback's blind spots.
-                workspace_manager = Some(
-                    globals
-                        .registry()
-                        .bind::<ExtWorkspaceManagerV1, _, _>(
-                            global.name,
-                            global.version.min(WORKSPACE_MANAGER_VERSION),
-                            &qh,
-                            (),
-                        ),
-                );
+                workspace_manager = Some(globals.registry().bind::<ExtWorkspaceManagerV1, _, _>(
+                    global.name,
+                    global.version.min(WORKSPACE_MANAGER_VERSION),
+                    &qh,
+                    (),
+                ));
             }
             "wl_output" => {
                 watcher.bind_output(globals.registry(), global.name, global.version, &qh)
@@ -191,10 +179,7 @@ fn run_connected(commands: &CommandSender) -> Result<(), String> {
         "cosmic_watcher: enabled ({TOPLEVEL_INFO_INTERFACE} v{}, \
          {WORKSPACE_MANAGER_INTERFACE} v{})",
         toplevel_info.version(),
-        workspace_manager
-            .as_ref()
-            .map(Proxy::version)
-            .unwrap_or(0)
+        workspace_manager.as_ref().map(Proxy::version).unwrap_or(0)
     );
     watcher.set_managers(toplevel_info);
     run_dispatch(queue, watcher)
@@ -581,7 +566,9 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for Watcher {
     ) {
         match event {
             ext_workspace_manager_v1::Event::Workspace { workspace, .. } => {
-                state.workspaces.insert(workspace.id(), Workspace::default());
+                state
+                    .workspaces
+                    .insert(workspace.id(), Workspace::default());
                 state.tracking_workspaces = true;
                 state.dirty = true;
             }
@@ -638,8 +625,7 @@ impl Dispatch<ExtWorkspaceHandleV1, ()> for Watcher {
                 let Some(workspace) = state.workspaces.get_mut(&handle.id()) else {
                     return;
                 };
-                let active =
-                    raw & u32::from(ext_workspace_handle_v1::State::Active) != 0;
+                let active = raw & u32::from(ext_workspace_handle_v1::State::Active) != 0;
                 if workspace.active != active {
                     workspace.active = active;
                     state.dirty = true;
@@ -706,8 +692,11 @@ mod tests {
             WAYWALLEN_WIN_HAS_NON_MINIMIZED | WAYWALLEN_WIN_HAS_ACTIVE
         );
         assert_eq!(
-            WindowState::from_event(&payload(&[ToplevelState::Maximized, ToplevelState::Activated]))
-                .to_flags(),
+            WindowState::from_event(&payload(&[
+                ToplevelState::Maximized,
+                ToplevelState::Activated
+            ]))
+            .to_flags(),
             WAYWALLEN_WIN_HAS_NON_MINIMIZED
                 | WAYWALLEN_WIN_HAS_ACTIVE
                 | WAYWALLEN_WIN_HAS_MAXIMIZED
@@ -718,7 +707,9 @@ mod tests {
                 ToplevelState::Fullscreen
             ]))
             .to_flags(),
-            WAYWALLEN_WIN_HAS_NON_MINIMIZED | WAYWALLEN_WIN_HAS_ACTIVE | WAYWALLEN_WIN_HAS_FULLSCREEN
+            WAYWALLEN_WIN_HAS_NON_MINIMIZED
+                | WAYWALLEN_WIN_HAS_ACTIVE
+                | WAYWALLEN_WIN_HAS_FULLSCREEN
         );
         // Sticky is tracked but has no flag of its own.
         let sticky = WindowState::from_event(&payload(&[ToplevelState::Sticky]));
@@ -729,8 +720,11 @@ mod tests {
     #[test]
     fn minimized_windows_contribute_nothing() {
         assert_eq!(
-            WindowState::from_event(&payload(&[ToplevelState::Minimized, ToplevelState::Activated]))
-                .to_flags(),
+            WindowState::from_event(&payload(&[
+                ToplevelState::Minimized,
+                ToplevelState::Activated
+            ]))
+            .to_flags(),
             0
         );
     }
@@ -775,7 +769,8 @@ mod tests {
         w.outputs.insert(output_id.clone(), output);
         let workspace_id = null_id();
         w.tracking_workspaces = true;
-        w.workspaces.insert(workspace_id.clone(), Workspace { active: false });
+        w.workspaces
+            .insert(workspace_id.clone(), Workspace { active: false });
         w.toplevels.insert(
             null_id(),
             Toplevel {
@@ -798,7 +793,8 @@ mod tests {
         w.outputs.insert(output_id.clone(), output);
         let workspace_id = null_id();
         w.tracking_workspaces = true;
-        w.workspaces.insert(workspace_id.clone(), Workspace { active: true });
+        w.workspaces
+            .insert(workspace_id.clone(), Workspace { active: true });
         w.toplevels.insert(
             null_id(),
             Toplevel {
@@ -826,7 +822,8 @@ mod tests {
         w.outputs.insert(output_id.clone(), output);
         let workspace_id = null_id();
         w.tracking_workspaces = true;
-        w.workspaces.insert(workspace_id.clone(), Workspace { active: false });
+        w.workspaces
+            .insert(workspace_id.clone(), Workspace { active: false });
         w.toplevels.insert(
             null_id(),
             Toplevel {
@@ -867,5 +864,3 @@ mod tests {
         );
     }
 }
-
-

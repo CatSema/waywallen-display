@@ -47,6 +47,9 @@ fn main() {
         .include(manifest_dir.join("src/generated"))
         .define("WAYWALLEN_DISPLAY_VERSION_PATCH", version_patch.as_str())
         .file(manifest_dir.join("src/display.c"))
+        .file(manifest_dir.join("src/presentation.c"))
+        .file(manifest_dir.join("src/egl_presenter.c"))
+        .file(manifest_dir.join("src/vulkan_presenter.c"))
         .file(manifest_dir.join("src/codec.c"))
         .file(manifest_dir.join("src/generated/ww_proto.c"))
         .flag("-std=c11")
@@ -82,8 +85,14 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=include/waywallen_display.h");
+    println!("cargo:rerun-if-changed=include/waywallen_display_presentation.h");
+    println!("cargo:rerun-if-changed=include/waywallen_display_egl_presenter.h");
+    println!("cargo:rerun-if-changed=include/waywallen_display_vulkan_presenter.h");
     for f in [
         "src/display.c",
+        "src/presentation.c",
+        "src/egl_presenter.c",
+        "src/vulkan_presenter.c",
         "src/codec.c",
         "src/backend_egl.c",
         "src/backend_vulkan.c",

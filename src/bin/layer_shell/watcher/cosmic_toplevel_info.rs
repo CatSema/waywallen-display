@@ -23,9 +23,9 @@ use wayland_client;
 use wayland_client::protocol::*;
 
 pub mod __interfaces {
-    use wayland_client::protocol::__interfaces::*;
     pub use super::_ftl_interfaces::*;
     pub use super::_ws_interfaces::*;
+    use wayland_client::protocol::__interfaces::*;
     wayland_scanner::generate_interfaces!(
         "src/bin/layer_shell/protocols/cosmic-toplevel-info-unstable-v1.xml"
     );
